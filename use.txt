@@ -1,0 +1,44 @@
+Everything is in /home/suhasdissa/Projects/BitsPlayer/IframeExtract. The release binary is already built, so you can skip step 1 unless you change code.
+
+cd ~/Projects/BitsPlayer/IframeExtract
+cargo build --release
+
+Recover I-frames from a truncated file (the actual use case — this file has no moov at all):
+
+./target/release/iframe-extract \
+  ../test-data-corpus/truncated/spring_1280x536_24fps_crf23__cut25_none.mp4 \
+  --size 1280x536 -o out/
+
+Writes out/frame_00000_off_0000000737.png … and prints how many NALs and access units it walked, where the chain broke, and which parameter sets it used. --size is mandatory; the resolution died with the moov.
+
+Useful additions:
+
+# machine-readable report (per-frame offsets, partial flags, recovered pic_init_qp)
+--json report.json
+
+# planar YUV instead of PNG — this is the byte-exact output
+--format yuv
+
+# also try the frame straddling the cut (reported, but openh264 won't decode it)
+--include-partial
+
+# dump the reconstructed elementary stream to check with another decoder
+--emit-annexb stream.264
+
+That last one is worth knowing about — it lets you sanity-check independently:
+
+./target/release/iframe-extract <file> --size 1280x536 -o out/ --emit-annexb s.264
+ffplay s.264        # or: h264dec s.264 out.yuv
+
+Run the full corpus evaluation (66 good + 198 truncated, ~2 min):
+
+python3 scripts/evaluate.py                    # everything
+python3 scripts/evaluate.py --only good        # just the ffmpeg byte-identity check
+python3 scripts/evaluate.py --filter keyintinf # substring filter on filename
+python3 scripts/evaluate.py --png-ssim 6       # add the PNG-vs-ffmpeg similarity numbers
+
+Tests:
+
+cargo test --release
+
+Needs ffmpeg on PATH for the harness (you have it). Full flag list via --help.
