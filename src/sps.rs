@@ -130,12 +130,46 @@ pub fn synthesize(width: u32, height: u32, opts: &X264Options, pic_init_qp: i32)
     }
 }
 
-/// x264 reserves one extra slot when B-pyramid is active; with no B-frames it uses `ref` as-is.
-/// This only sizes the DPB and never affects parsing of an I slice.
+/// Matches x264's `x264_sps_init`: DPB size is max(ref, 1+reorder, pyramid?4:1), then one slot
+/// is dropped for a strict B-pyramid. The old `refs+1` rule only agreed with that formula for
+/// the corpus's `ref=3` / normal-pyramid encodes.
 fn max_num_ref_frames(opts: &X264Options) -> u32 {
-    if opts.bframes > 0 {
-        opts.refs + 1
-    } else {
-        opts.refs
+    if opts.bframes == 0 {
+        return opts.refs.min(16);
+    }
+    let pyramid = opts.b_pyramid;
+    let num_reorder = if pyramid > 0 { 2 } else { 1 };
+    let mut n = opts
+        .refs
+        .max(1 + num_reorder)
+        .max(if pyramid > 0 { 4 } else { 1 })
+        .min(16);
+    if pyramid == 1 {
+        n = n.saturating_sub(1);
+    }
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(refs: u32, bframes: u32, b_pyramid: u32) -> X264Options {
+        X264Options {
+            refs,
+            bframes,
+            b_pyramid,
+            ..X264Options::default()
+        }
+    }
+
+    #[test]
+    fn dpb_matches_x264_for_corpus_and_high_ref() {
+        // Corpus: ref=3, bframes=3, normal pyramid → max(3, 3, 4) = 4.
+        assert_eq!(max_num_ref_frames(&opts(3, 3, 2)), 4);
+        // test.mp4: ref=5, bframes=3, normal pyramid → max(5, 3, 4) = 5, not refs+1=6.
+        assert_eq!(max_num_ref_frames(&opts(5, 3, 2)), 5);
+        assert_eq!(max_num_ref_frames(&opts(3, 0, 0)), 3);
+        assert_eq!(max_num_ref_frames(&opts(4, 3, 1)), 3); // strict pyramid drops one
     }
 }

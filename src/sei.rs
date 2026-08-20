@@ -5,11 +5,16 @@
 use crate::bits::unescape_rbsp;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default)]
+/// Encoder knobs recovered from x264's option SEI, or typical x264 defaults when that
+/// SEI is missing. Zeroed defaults would synthesise Baseline/CAVLC and fail on the High/CABAC
+/// streams that make up most real-world input.
+#[derive(Debug, Clone)]
 pub struct X264Options {
     pub cabac: bool,
     pub transform_8x8: bool,
     pub bframes: u32,
+    /// 0 = none, 1 = strict, 2 = normal. x264 default is normal whenever B-frames are on.
+    pub b_pyramid: u32,
     pub refs: u32,
     pub chroma_qp_offset: i32,
     pub constrained_intra: bool,
@@ -21,16 +26,24 @@ pub struct X264Options {
     pub qp: Option<i32>,
 }
 
+impl Default for X264Options {
+    fn default() -> Self {
+        Self::from_map(HashMap::new())
+    }
+}
+
 impl X264Options {
     fn from_map(raw: HashMap<String, String>) -> Self {
         let get_u32 = |k: &str, d: u32| raw.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
         let get_i32 = |k: &str, d: i32| raw.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
         let get_bool = |k: &str, d: bool| raw.get(k).map(|v| v != "0").unwrap_or(d);
 
+        let bframes = get_u32("bframes", 3);
         Self {
             cabac: get_bool("cabac", true),
             transform_8x8: get_bool("8x8dct", true),
-            bframes: get_u32("bframes", 3),
+            bframes,
+            b_pyramid: get_u32("b_pyramid", if bframes > 0 { 2 } else { 0 }),
             refs: get_u32("ref", 3),
             chroma_qp_offset: get_i32("chroma_qp_offset", 0),
             constrained_intra: get_bool("constrained_intra", false),

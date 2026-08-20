@@ -52,15 +52,18 @@ the file and therefore always survives a tail truncation:
 cabac=1 ref=3 8x8dct=1 chroma_qp_offset=-2 bframes=3 keyint=48 rc=crf crf=23.0 ...
 ```
 
-The remaining fields were calibrated against the real `avcC` of all 66 intact corpus files:
-`log2_max_frame_num` is 4 throughout regardless of keyint, `pic_order_cnt_type` is 0 (lsb 6)
-unless there are no B-frames in which case it is 2, scaling matrices never appear, and
-`gaps_in_frame_num_value_allowed` is always 0. On the baseline encode the synthesised PPS comes
-out byte-identical to the real one.
+The remaining fields follow x264's header writer rather than a single corpus snapshot:
+`log2_max_frame_num` is 4 for ordinary GOPs, `pic_order_cnt_type` is 0 (lsb 6) unless there are
+no B-frames in which case it is 2, DPB size uses x264's max(ref, 1+reorder, pyramid?4:1) rule,
+scaling matrices never appear, and `gaps_in_frame_num_value_allowed` is always 0. On the baseline
+encode the synthesised PPS comes out byte-identical to the real one.
 
-`pic_init_qp` is the one field the SEI cannot pin down, and only for two-pass encodes. It is
-found by search, validated by decoding the first IDR — CABAC context initialisation depends on
-SliceQPY, so a wrong guess desynchronises the decoder and fails loudly rather than silently.
+`pic_init_qp` is the one field the SEI cannot pin down. Plain CRF often matches `round(crf)`, but
+`--stitchable` and ABR leave x264's PPS default of 26. The tool searches, trying the SEI hint
+first, and validates each candidate by decoding the first IDR — CABAC context initialisation
+depends on SliceQPY, so a wrong guess desynchronises the decoder and fails loudly rather than
+silently. If that still fails, a short fallback tries the other common entropy / transform /
+POC flavours so a missing or non-x264 SEI is not fatal.
 
 **Group access units.** A VCL NAL with `first_mb_in_slice == 0` starts a new picture, so
 multi-slice encodes group correctly without relying on access unit delimiters.
@@ -114,4 +117,6 @@ below 1). The decoded image itself is exact.
 - **Non-IDR I-slices** yield nothing on this corpus, since x264 with `open_gop=0` does not emit
   them. The code path exists so the tool stays honest on arbitrary input.
 - **The calibration table is x264-specific.** Other encoders fall back to the search path, which
-  widens considerably.
+  tries the opposite entropy coder, 8×8 transform, and POC type, plus every `pic_init_qp`. That
+  covers typical High/Main/Baseline IDRs; it will not invent a scaling matrix or an interlaced
+  SPS.

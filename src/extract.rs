@@ -217,7 +217,7 @@ fn group_access_units(nals: &[Nal], data: &[u8], clean_end: bool) -> Vec<AccessU
 }
 
 /// In-band parameter sets win when present. Otherwise synthesise, searching for `pic_init_qp`
-/// when the SEI does not pin it down.
+/// (and a few encoder-flavour fallbacks) because the SEI cannot pin that field down.
 fn recover_parameter_sets(
     data: &[u8],
     nals: &[Nal],
@@ -252,40 +252,119 @@ fn recover_parameter_sets(
         .find(|a| a.is_idr && a.complete)
         .or_else(|| access_units.iter().find(|a| a.is_intra && a.complete));
 
-    for (attempt, qp) in qp_candidates(x264_opts).into_iter().enumerate() {
-        let params = synthesize(opts.width, opts.height, x264_opts, qp);
-        let Some(au) = probe_au else {
-            // Nothing to validate against; trust the first candidate.
-            return Ok((params, attempt + 1));
-        };
+    let mut attempts = 0usize;
+    for variant in option_variants(x264_opts) {
+        for qp in qp_candidates(&variant) {
+            attempts += 1;
+            let params = synthesize(opts.width, opts.height, &variant, qp);
+            let Some(au) = probe_au else {
+                // Nothing to validate against; trust the first candidate.
+                return Ok((params, attempts));
+            };
 
-        let payloads: Vec<&[u8]> = au.nal_indices.iter().map(|&i| nals[i].payload(data)).collect();
-        let mut units: Vec<&[u8]> = vec![&params.sps, &params.pps];
-        units.extend_from_slice(&payloads);
+            let payloads: Vec<&[u8]> = au.nal_indices.iter().map(|&i| nals[i].payload(data)).collect();
+            let mut units: Vec<&[u8]> = vec![&params.sps, &params.pps];
+            units.extend_from_slice(&payloads);
 
-        let mut decoder = OpenH264Backend::new(false)?;
-        if let Ok(Some(_)) = decoder.decode_au(&to_annexb(&units)) {
-            return Ok((params, attempt + 1));
+            let mut decoder = OpenH264Backend::new(false)?;
+            if let Ok(Some(_)) = decoder.decode_au(&to_annexb(&units)) {
+                return Ok((params, attempts));
+            }
         }
     }
 
-    bail!("could not find a pic_init_qp that decodes the first intra frame")
+    bail!("could not find parameter sets that decode the first intra frame")
 }
 
-/// `rc=crf` pins the value exactly (verified across the corpus: pic_init_qp == round(crf)).
-/// Otherwise 26 covers every CBR encode, and two-pass lands in the low twenties.
+/// CRF is a first guess, not a pin. x264 writes `pic_init_qp = round(crf)` only for plain CRF;
+/// `--stitchable` and ABR leave the PPS default of 26 (see `x264_pps_init`). The Spring corpus
+/// is all plain CRF, so treating the SEI value as exact made the tool fail on otherwise ordinary
+/// x264 files.
 fn qp_candidates(opts: &X264Options) -> Vec<i32> {
+    let mut candidates = Vec::with_capacity(52);
+    let mut push = |q: i32| {
+        if (0..=51).contains(&q) && !candidates.contains(&q) {
+            candidates.push(q);
+        }
+    };
+
     if let Some(qp) = opts.qp {
-        return vec![qp];
+        push(qp);
     }
     if opts.rc == "crf"
         && let Some(crf) = opts.crf
     {
-        return vec![crf.round() as i32];
+        push(crf.round() as i32);
+    }
+    push(26);
+    for q in 19..=25 {
+        push(q);
+    }
+    for q in 0..=51 {
+        push(q);
+    }
+    candidates
+}
+
+/// If the SEI-derived (or default) knobs fail to decode, try the other common H.264 flavour:
+/// the opposite entropy coder, 8x8 transform off, and no B-frames (POC type 2). Each variant
+/// still runs the QP search; the first one is the SEI/default path so the corpus stays fast.
+fn option_variants(base: &X264Options) -> Vec<X264Options> {
+    let mut out = vec![base.clone()];
+    let mut push = |next: X264Options| {
+        let dup = out.iter().any(|o| {
+            o.cabac == next.cabac
+                && o.transform_8x8 == next.transform_8x8
+                && o.bframes == next.bframes
+                && o.refs == next.refs
+                && o.b_pyramid == next.b_pyramid
+        });
+        if !dup {
+            out.push(next);
+        }
+    };
+
+    let mut alt = base.clone();
+    alt.cabac = !base.cabac;
+    push(alt);
+
+    let mut alt = base.clone();
+    alt.transform_8x8 = !base.transform_8x8;
+    push(alt);
+
+    let mut alt = base.clone();
+    alt.bframes = 0;
+    alt.b_pyramid = 0;
+    push(alt);
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crf_is_a_hint_not_a_pin() {
+        let opts = X264Options {
+            rc: "crf".into(),
+            crf: Some(23.0),
+            ..X264Options::default()
+        };
+        let c = qp_candidates(&opts);
+        assert_eq!(c[0], 23, "plain CRF still tries round(crf) first");
+        assert!(c.contains(&26), "stitchable/ABR default must remain reachable");
+        assert_eq!(c.len(), 52);
     }
 
-    let mut candidates = vec![26];
-    candidates.extend(19..=25);
-    candidates.extend((0..=51).filter(|q| !(19..=26).contains(q)));
-    candidates
+    #[test]
+    fn two_pass_still_starts_at_26() {
+        let opts = X264Options {
+            rc: "2pass".into(),
+            ..X264Options::default()
+        };
+        let c = qp_candidates(&opts);
+        assert_eq!(c[0], 26);
+        assert_eq!(c.len(), 52);
+    }
 }
