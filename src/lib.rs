@@ -5,6 +5,7 @@ pub mod container;
 pub mod decode;
 pub mod extract;
 pub mod nal;
+pub mod report;
 pub mod sei;
 pub mod slice;
 pub mod sps;

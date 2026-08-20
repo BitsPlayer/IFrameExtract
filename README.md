@@ -15,6 +15,9 @@ Scope: MP4 / H.264 / no audio / known resolution.
 iframe-extract <input.mp4> --size 1280x536 -o out/
 ```
 
+Stderr gets a pacman-style progress bar for each phase (read, walk, recover, decode, write).
+`-q` silences it.
+
 | flag | meaning |
 |---|---|
 | `--size WxH` | **required** — resolution cannot be recovered without an SPS |
@@ -24,6 +27,7 @@ iframe-extract <input.mp4> --size 1280x536 -o out/
 | `--include-partial` | also attempt the frame straddling the cut |
 | `--json FILE` | machine-readable report |
 | `--emit-annexb FILE` | recovered elementary stream, for cross-checking with other decoders |
+| `-q` | no progress bar or summary |
 
 Output is named `frame_00007_off_0000151793.png`. No timestamps: the timescale lives in `moov`
 and the frame rate in the SPS VUI, both lost. The byte offset is stable and joins directly

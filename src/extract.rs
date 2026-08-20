@@ -6,6 +6,7 @@ use serde::Serialize;
 use crate::container::find_mdat;
 use crate::decode::{FrameDecoder, Frame, OpenH264Backend, to_annexb};
 use crate::nal::{self, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SLICE, NAL_SPS, Nal};
+use crate::report::{Reporter, Silent};
 use crate::sei::{X264Options, parse_x264_sei};
 use crate::slice;
 use crate::sps::{ParamSource, ParameterSets, synthesize};
@@ -66,11 +67,39 @@ pub struct Extraction {
 }
 
 pub fn extract(data: &[u8], input_name: &str, opts: &Options) -> Result<Extraction> {
+    extract_with(data, input_name, opts, &mut Silent)
+}
+
+pub fn extract_with(
+    data: &[u8],
+    input_name: &str,
+    opts: &Options,
+    reporter: &mut dyn Reporter,
+) -> Result<Extraction> {
+    reporter.phase("finding mdat");
     let mdat = find_mdat(data)?;
+    reporter.finish_phase(&format!(
+        "payload {}..{} ({})",
+        mdat.payload_start,
+        mdat.payload_end,
+        crate::report::human_bytes(mdat.payload_end.saturating_sub(mdat.payload_start)),
+    ));
+
     let mb_count = opts.width.div_ceil(16) * opts.height.div_ceil(16);
-    let walk = nal::walk(data, &mdat, mb_count);
+    reporter.phase("walking NAL chain");
+    let walk = nal::walk(data, &mdat, mb_count, reporter);
     if walk.nals.is_empty() {
         bail!("no NAL units recovered from mdat");
+    }
+    reporter.finish_phase(&format!(
+        "{} NALs, {}-byte length prefixes",
+        walk.nals.len(),
+        walk.nal_length_size
+    ));
+    if let Some(off) = walk.truncation_offset {
+        reporter.note(&format!("chain broke at offset {off} (file is truncated)"));
+    } else {
+        reporter.note("chain ran cleanly to the end of mdat");
     }
 
     let x264_opts = walk
@@ -82,22 +111,52 @@ pub fn extract(data: &[u8], input_name: &str, opts: &Options) -> Result<Extracti
     let x264_opts = x264_opts.unwrap_or_default();
 
     let access_units = group_access_units(&walk.nals, data, walk.truncation_offset.is_none());
-    let (params, qp_attempts) = recover_parameter_sets(data, &walk.nals, &access_units, &x264_opts, opts)?;
+    reporter.note(&format!(
+        "{} access units, {} intra",
+        access_units.len(),
+        access_units.iter().filter(|a| a.is_intra).count()
+    ));
+
+    if x264_options_found {
+        reporter.note(&format!(
+            "x264 SEI: cabac={} ref={} bframes={} 8x8dct={} rc={}{}",
+            x264_opts.cabac as u8,
+            x264_opts.refs,
+            x264_opts.bframes,
+            x264_opts.transform_8x8 as u8,
+            x264_opts.rc,
+            x264_opts
+                .crf
+                .map(|c| format!(" crf={c}"))
+                .unwrap_or_default(),
+        ));
+    } else {
+        reporter.note("no x264 options SEI; using typical High/CABAC defaults");
+    }
+    reporter.phase("recovering parameter sets");
+    let (params, qp_attempts) =
+        recover_parameter_sets(data, &walk.nals, &access_units, &x264_opts, opts, reporter)?;
+    reporter.finish_phase(&format!(
+        "{:?}, qp {}, {} attempt(s)",
+        params.source, params.pic_init_qp, qp_attempts
+    ));
 
     let mut decoder = OpenH264Backend::new(opts.include_partial)?;
     let mut frames = Vec::new();
     let mut records = Vec::new();
     let mut annexb = to_annexb(&[&params.sps, &params.pps]);
 
+    let wanted: Vec<&AccessUnit> = access_units
+        .iter()
+        .filter(|au| {
+            let keep = au.is_idr || (opts.include_non_idr && au.is_intra);
+            keep && (au.complete || opts.include_partial)
+        })
+        .collect();
+
+    reporter.phase("decoding I-frames");
     let mut emitted = 0usize;
-    for au in &access_units {
-        let wanted = au.is_idr || (opts.include_non_idr && au.is_intra);
-        if !wanted {
-            continue;
-        }
-        if !au.complete && !opts.include_partial {
-            continue;
-        }
+    for (i, au) in wanted.iter().enumerate() {
 
         // For a partial picture, hand the decoder only the slices that arrived whole. A slice cut
         // mid-CABAC makes openh264 discard the entire picture, whereas a picture that is merely
@@ -142,7 +201,13 @@ pub fn extract(data: &[u8], input_name: &str, opts: &Options) -> Result<Extracti
             frames.push((record, frame));
         }
         emitted += 1;
+        reporter.progress(
+            (i + 1) as u64,
+            wanted.len() as u64,
+            &format!("frame {}/{}  off {}", i + 1, wanted.len(), au.offset),
+        );
     }
+    reporter.finish_phase(&format!("{} of {} decoded", frames.len(), wanted.len()));
 
     let report = Report {
         input: input_name.to_string(),
@@ -224,6 +289,7 @@ fn recover_parameter_sets(
     access_units: &[AccessUnit],
     x264_opts: &X264Options,
     opts: &Options,
+    reporter: &mut dyn Reporter,
 ) -> Result<(ParameterSets, usize)> {
     let in_band_sps = nals
         .iter()
@@ -253,10 +319,18 @@ fn recover_parameter_sets(
         .or_else(|| access_units.iter().find(|a| a.is_intra && a.complete));
 
     let mut attempts = 0usize;
-    for variant in option_variants(x264_opts) {
-        for qp in qp_candidates(&variant) {
+    let variants = option_variants(x264_opts);
+    let qp_lists: Vec<Vec<i32>> = variants.iter().map(qp_candidates).collect();
+    let search_len: u64 = qp_lists.iter().map(|q| q.len() as u64).sum::<u64>().max(1);
+    for (variant, qps) in variants.iter().zip(&qp_lists) {
+        for &qp in qps {
             attempts += 1;
-            let params = synthesize(opts.width, opts.height, &variant, qp);
+            reporter.progress(
+                attempts as u64,
+                search_len,
+                &format!("trying qp {qp}"),
+            );
+            let params = synthesize(opts.width, opts.height, variant, qp);
             let Some(au) = probe_au else {
                 // Nothing to validate against; trust the first candidate.
                 return Ok((params, attempts));

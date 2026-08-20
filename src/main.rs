@@ -1,9 +1,15 @@
+mod progress;
+
 use iframe_extract::decode::ColorMatrix;
 use iframe_extract::extract;
+use iframe_extract::report::{self, Reporter};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use std::path::PathBuf;
+use progress::PacmanBar;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Format {
@@ -43,7 +49,7 @@ struct Args {
     #[arg(long)]
     include_non_idr: bool,
 
-    /// Also emit the frame straddling the truncation point, decoded with error concealment.
+    /// Also attempt the frame straddling the truncation point, decoded with error concealment.
     #[arg(long)]
     include_partial: bool,
 
@@ -67,12 +73,48 @@ fn parse_size(s: &str) -> Result<(u32, u32)> {
     Ok((w.trim().parse()?, h.trim().parse()?))
 }
 
+fn read_input(path: &Path, reporter: &mut dyn Reporter) -> Result<Vec<u8>> {
+    let file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    reporter.phase("reading file");
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut data = Vec::new();
+    if total > 0 {
+        data.reserve(total as usize);
+    }
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+        reporter.progress(
+            data.len() as u64,
+            total.max(data.len() as u64),
+            &report::human_bytes(data.len() as u64),
+        );
+    }
+    reporter.finish_phase(&report::human_bytes(data.len() as u64));
+    Ok(data)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let (width, height) = parse_size(&args.size)?;
 
-    let data = std::fs::read(&args.input)
-        .with_context(|| format!("reading {}", args.input.display()))?;
+    let mut reporter = PacmanBar::new(!args.quiet);
+    if !args.quiet {
+        let size = std::fs::metadata(&args.input)
+            .map(|m| report::human_bytes(m.len()))
+            .unwrap_or_else(|_| "?".into());
+        reporter.header(&format!(
+            "extracting {} ({size}, {width}x{height})",
+            args.input.display()
+        ));
+    }
+
+    let data = read_input(&args.input, &mut reporter)?;
 
     let opts = extract::Options {
         width,
@@ -82,12 +124,18 @@ fn main() -> Result<()> {
     };
 
     let name = args.input.display().to_string();
-    let result = extract::extract(&data, &name, &opts)?;
+    let result = extract::extract_with(&data, &name, &opts, &mut reporter)?;
 
     std::fs::create_dir_all(&args.output)
         .with_context(|| format!("creating {}", args.output.display()))?;
 
-    for (record, frame) in &result.frames {
+    let ext = match args.format {
+        Format::Png => "PNG",
+        Format::Yuv => "YUV",
+    };
+    reporter.phase(&format!("writing {ext}"));
+    let nframes = result.frames.len();
+    for (i, (record, frame)) in result.frames.iter().enumerate() {
         let stem = format!(
             "frame_{:05}_off_{:010}{}",
             record.index,
@@ -112,33 +160,40 @@ fn main() -> Result<()> {
                     .with_context(|| format!("writing {}", path.display()))?;
             }
         }
+        reporter.progress(
+            (i + 1) as u64,
+            nframes as u64,
+            &format!("{}/{nframes}  {stem}", i + 1),
+        );
     }
+    reporter.finish_phase(&format!("{nframes} files in {}", args.output.display()));
 
     if let Some(path) = &args.emit_annexb {
+        reporter.note(&format!("writing Annex B stream to {}", path.display()));
         std::fs::write(path, &result.annexb)
             .with_context(|| format!("writing {}", path.display()))?;
     }
 
     if let Some(path) = &args.json {
+        reporter.note(&format!("writing JSON report to {}", path.display()));
         let json = serde_json::to_string_pretty(&result.report)?;
         std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
     }
 
     if !args.quiet {
         let r = &result.report;
-        println!(
-            "{}: {} NALs, {} access units, {} frames written ({:?} params, qp {}, {} attempt(s))",
-            args.input.display(),
+        reporter.summary(&format!(
+            "{} NALs, {} access units, {} frames written ({:?} params, qp {}, {} attempt(s))",
             r.nal_count,
             r.access_units,
             result.frames.len(),
             r.param_source,
             r.pic_init_qp,
             r.qp_search_attempts,
-        );
+        ));
         match r.truncation_offset {
-            Some(off) => println!("  chain broke at offset {off} (file is truncated)"),
-            None => println!("  chain ran cleanly to the end of mdat"),
+            Some(off) => reporter.summary(&format!("chain broke at offset {off}")),
+            None => reporter.summary("chain ran cleanly to the end of mdat"),
         }
     }
 

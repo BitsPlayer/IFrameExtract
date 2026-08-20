@@ -5,6 +5,7 @@
 //! frame boundary exactly, and the chain stops validating precisely at the truncation point.
 
 use crate::container::MdatRange;
+use crate::report::Reporter;
 
 /// NAL unit types x264 actually emits. Anything else is treated as a broken chain, which is what
 /// makes `startcodes` and `random` padding fail to produce plausible successors.
@@ -149,7 +150,12 @@ fn probe(data: &[u8], mdat: &MdatRange, length_size: usize, mb_count: u32) -> us
     count
 }
 
-pub fn walk(data: &[u8], mdat: &MdatRange, mb_count: u32) -> Walk {
+pub fn walk(
+    data: &[u8],
+    mdat: &MdatRange,
+    mb_count: u32,
+    reporter: &mut dyn Reporter,
+) -> Walk {
     // 4 is universal for MP4, but probe so the tool does not silently misparse an odd file.
     let length_size = [4usize, 2, 1, 3]
         .into_iter()
@@ -158,8 +164,11 @@ pub fn walk(data: &[u8], mdat: &MdatRange, mb_count: u32) -> Walk {
 
     let mut nals = Vec::new();
     let mut cur = mdat.payload_start;
+    let start = mdat.payload_start;
     let end = mdat.payload_end;
+    let span = end.saturating_sub(start).max(1);
     let mut truncation_offset = None;
+    let mut last_report = start;
 
     loop {
         if cur + length_size as u64 > end {
@@ -210,6 +219,14 @@ pub fn walk(data: &[u8], mdat: &MdatRange, mb_count: u32) -> Walk {
             break;
         }
         cur = payload + len;
+        if cur - last_report >= 512 * 1024 {
+            reporter.progress(
+                cur.saturating_sub(start),
+                span,
+                &format!("{} NALs, {}", nals.len(), crate::report::human_bytes(cur.saturating_sub(start))),
+            );
+            last_report = cur;
+        }
     }
 
     // Confirm-by-successor: if the walk stopped on an invalid successor rather than at the end of
