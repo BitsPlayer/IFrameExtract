@@ -192,7 +192,10 @@ fn main() -> Result<()> {
             r.qp_search_attempts,
         ));
         match r.truncation_offset {
-            Some(off) => reporter.summary(&format!("chain broke at offset {off}")),
+            Some(off) => reporter.summary(&format!(
+                "chain broke at offset {off} ({:.2}% of file)",
+                off as f64 / data.len().max(1) as f64 * 100.0
+            )),
             None => reporter.summary("chain ran cleanly to the end of mdat"),
         }
     }

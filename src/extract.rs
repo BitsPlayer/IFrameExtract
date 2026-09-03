@@ -32,6 +32,9 @@ pub struct AccessUnit {
 pub struct FrameRecord {
     pub index: usize,
     pub offset: u64,
+    /// Bytes this picture occupies in the source file: every NAL's length prefix plus the payload
+    /// bytes actually present. For a partial picture this is less than the container declares.
+    pub source_size: u64,
     pub nal_type: u8,
     pub slice_count: usize,
     pub partial: bool,
@@ -97,7 +100,10 @@ pub fn extract_with(
         walk.nal_length_size
     ));
     if let Some(off) = walk.truncation_offset {
-        reporter.note(&format!("chain broke at offset {off} (file is truncated)"));
+        reporter.note(&format!(
+            "chain broke at offset {off} ({:.2}% of file; file is truncated)",
+            off as f64 / data.len().max(1) as f64 * 100.0
+        ));
     } else {
         reporter.note("chain ran cleanly to the end of mdat");
     }
@@ -188,9 +194,15 @@ pub fn extract_with(
                 None
             }
         };
+        let source_size: u64 = au
+            .nal_indices
+            .iter()
+            .map(|&i| (walk.nal_length_size + walk.nals[i].available_len) as u64)
+            .sum();
         let record = FrameRecord {
             index: emitted,
             offset: au.offset,
+            source_size,
             nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
             slice_count: au.nal_indices.len(),
             partial: !au.complete,
