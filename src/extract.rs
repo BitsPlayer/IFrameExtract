@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::container::find_mdat;
-use crate::decode::{FrameDecoder, Frame, OpenH264Backend, to_annexb};
+use crate::decode::{Frame, FrameDecoder, OpenH264Backend, to_annexb};
 use crate::nal::{self, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SLICE, NAL_SPS, Nal};
 use crate::report::{Reporter, Silent};
 use crate::sei::{X264Options, parse_x264_sei};
@@ -50,6 +50,10 @@ pub struct Report {
     pub nal_length_size: usize,
     pub nal_count: usize,
     pub truncation_offset: Option<u64>,
+    /// Runs inside `mdat` that are not part of the video chain - the interleaved chunks of another
+    /// track, usually audio - which the walk stepped over.
+    pub skipped_regions: usize,
+    pub skipped_bytes: u64,
     /// End of the last fully received picture. Everything before this is intact data; anything
     /// after it is either the frame straddling the cut or padding.
     pub trusted_data_end: u64,
@@ -99,6 +103,13 @@ pub fn extract_with(
         walk.nals.len(),
         walk.nal_length_size
     ));
+    if walk.skipped_regions > 0 {
+        reporter.note(&format!(
+            "stepped over {} non-video region(s) totalling {} (interleaved audio or another track)",
+            walk.skipped_regions,
+            crate::report::human_bytes(walk.skipped_bytes),
+        ));
+    }
     if let Some(off) = walk.truncation_offset {
         reporter.note(&format!(
             "chain broke at offset {off} ({:.2}% of file; file is truncated)",
@@ -163,7 +174,6 @@ pub fn extract_with(
     reporter.phase("decoding I-frames");
     let mut emitted = 0usize;
     for (i, au) in wanted.iter().enumerate() {
-
         // For a partial picture, hand the decoder only the slices that arrived whole. A slice cut
         // mid-CABAC makes openh264 discard the entire picture, whereas a picture that is merely
         // missing its trailing slices can be concealed, recovering the macroblock rows that did
@@ -229,6 +239,8 @@ pub fn extract_with(
         nal_length_size: walk.nal_length_size,
         nal_count: walk.nals.len(),
         truncation_offset: walk.truncation_offset,
+        skipped_regions: walk.skipped_regions,
+        skipped_bytes: walk.skipped_bytes,
         trusted_data_end: access_units
             .iter()
             .filter(|au| au.complete)
@@ -337,18 +349,18 @@ fn recover_parameter_sets(
     for (variant, qps) in variants.iter().zip(&qp_lists) {
         for &qp in qps {
             attempts += 1;
-            reporter.progress(
-                attempts as u64,
-                search_len,
-                &format!("trying qp {qp}"),
-            );
+            reporter.progress(attempts as u64, search_len, &format!("trying qp {qp}"));
             let params = synthesize(opts.width, opts.height, variant, qp);
             let Some(au) = probe_au else {
                 // Nothing to validate against; trust the first candidate.
                 return Ok((params, attempts));
             };
 
-            let payloads: Vec<&[u8]> = au.nal_indices.iter().map(|&i| nals[i].payload(data)).collect();
+            let payloads: Vec<&[u8]> = au
+                .nal_indices
+                .iter()
+                .map(|&i| nals[i].payload(data))
+                .collect();
             let mut units: Vec<&[u8]> = vec![&params.sps, &params.pps];
             units.extend_from_slice(&payloads);
 
@@ -439,7 +451,10 @@ mod tests {
         };
         let c = qp_candidates(&opts);
         assert_eq!(c[0], 23, "plain CRF still tries round(crf) first");
-        assert!(c.contains(&26), "stitchable/ABR default must remain reachable");
+        assert!(
+            c.contains(&26),
+            "stitchable/ABR default must remain reachable"
+        );
         assert_eq!(c.len(), 52);
     }
 

@@ -11,6 +11,10 @@ pub struct MdatRange {
     pub payload_start: u64,
     /// End of the payload as declared by the box header, clamped to the file length.
     pub payload_end: u64,
+    /// False when the declared size runs past EOF, i.e. the box itself was cut short. A complete
+    /// `mdat` means any trailing bytes the NAL chain cannot parse are another track's data rather
+    /// than the truncation point.
+    pub complete: bool,
 }
 
 /// Walks top-level boxes from offset 0 and returns the first `mdat` payload range.
@@ -31,7 +35,9 @@ pub fn find_mdat(data: &[u8]) -> Result<MdatRange> {
                     bail!("truncated 64-bit box header at offset {off}");
                 }
                 let large = u64::from_be_bytes(
-                    data[off as usize + 8..off as usize + 16].try_into().unwrap(),
+                    data[off as usize + 8..off as usize + 16]
+                        .try_into()
+                        .unwrap(),
                 );
                 (16u64, large)
             }
@@ -50,6 +56,7 @@ pub fn find_mdat(data: &[u8]) -> Result<MdatRange> {
                 // The declared size is never trusted: a truncated file's mdat header still
                 // advertises the original length, which runs well past EOF.
                 payload_end: declared_end.min(file_len),
+                complete: declared_end <= file_len,
             });
         }
 
