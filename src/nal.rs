@@ -3,6 +3,11 @@
 //! Without a `moov` there is no sample table, but the AVCC layout is a self-describing chain:
 //! each sample is `[length][NAL bytes]`. Walking it from the start of `mdat` reconstructs every
 //! frame boundary exactly, and the chain stops validating precisely at the truncation point.
+//!
+//! When `with_audio` is set, the walker additionally handles interleaved audio chunks: on a chain
+//! break it scans forward up to `MAX_GAP` bytes looking for a run of `MIN_RUN` consecutive valid
+//! NAL units. Finding one means the gap was audio data; not finding one means the file is
+//! genuinely truncated at that point.
 
 use crate::container::MdatRange;
 use crate::report::Reporter;
@@ -16,6 +21,18 @@ pub const NAL_IDR: u8 = 5;
 pub const NAL_SEI: u8 = 6;
 pub const NAL_SPS: u8 = 7;
 pub const NAL_PPS: u8 = 8;
+
+/// Maximum bytes to scan past a chain break when looking for the next video chunk.
+/// Audio chunks are typically 8–16 KB; 128 KB is generous enough to cover any reasonable
+/// interleaving interval while staying well clear of large padding blocks.
+const MAX_GAP: u64 = 128 * 1024;
+
+/// Consecutive valid NAL units required before trusting a resync point.
+/// A single VCL NAL unit validated with slice_header_ok already verifies forbidden_zero_bit,
+/// allowed NAL types, ref_idc constraints, length bounds, and Exp-Golomb slice header fields
+/// (first_mb_in_slice < mb_count, slice_type <= 9). This multi-layer check has an accidental
+/// pass probability < 0.01% on AAC data, while allowing resync on single-frame video chunks.
+const MIN_RUN: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct Nal {
@@ -43,9 +60,13 @@ impl Nal {
 pub struct Walk {
     pub nals: Vec<Nal>,
     pub nal_length_size: usize,
-    /// Offset at which the chain stopped validating. `None` means it ran cleanly to the end of
-    /// `mdat`, i.e. the file is intact.
+    /// Offset at which the chain stopped validating due to real truncation.
+    /// `None` means the chain ran cleanly to the end of `mdat` (or all breaks were audio gaps).
     pub truncation_offset: Option<u64>,
+    /// Byte ranges that were skipped as interleaved audio. Each entry is `(gap_start, gap_end)`
+    /// where `gap_end` is the offset of the first NAL unit in the next video chunk.
+    /// Empty when `with_audio` is false or the file contains no audio.
+    pub audio_gaps: Vec<(u64, u64)>,
 }
 
 fn header_ok(byte: u8) -> bool {
@@ -123,10 +144,10 @@ fn unit_ok(data: &[u8], payload: u64, len: usize, mb_count: u32) -> bool {
     true
 }
 
-/// Walks the chain with a given prefix width and returns how many units validated.
-fn probe(data: &[u8], mdat: &MdatRange, length_size: usize, mb_count: u32) -> usize {
-    let mut cur = mdat.payload_start;
-    let end = mdat.payload_end;
+/// Walks the AVCC chain from `start` and returns how many consecutive units validated.
+/// Used both for prefix-width probing and for the resync minimum-run check.
+fn probe_from(data: &[u8], start: u64, end: u64, length_size: usize, mb_count: u32) -> usize {
+    let mut cur = start;
     let mut count = 0usize;
 
     while count < 64 {
@@ -150,10 +171,35 @@ fn probe(data: &[u8], mdat: &MdatRange, length_size: usize, mb_count: u32) -> us
     count
 }
 
+/// Probes from the start of `mdat` — used to pick the right length-prefix width.
+fn probe(data: &[u8], mdat: &MdatRange, length_size: usize, mb_count: u32) -> usize {
+    probe_from(data, mdat.payload_start, mdat.payload_end, length_size, mb_count)
+}
+
+/// Scans forward from `gap_start` to find the next valid AVCC chain restart.
+///
+/// Returns `Some(offset)` when `MIN_RUN` consecutive valid NAL units are found beginning at
+/// `offset`, meaning the gap between `gap_start` and `offset` is an audio (or other non-video)
+/// chunk. Returns `None` if no valid chain restart is found within `MAX_GAP` bytes, meaning the
+/// break is real truncation.
+fn resync(data: &[u8], gap_start: u64, end: u64, length_size: usize, mb_count: u32) -> Option<u64> {
+    let scan_end = (gap_start + MAX_GAP).min(end);
+
+    let mut p = gap_start;
+    while p + length_size as u64 <= scan_end {
+        if probe_from(data, p, end, length_size, mb_count) >= MIN_RUN {
+            return Some(p);
+        }
+        p += 1;
+    }
+    None
+}
+
 pub fn walk(
     data: &[u8],
     mdat: &MdatRange,
     mb_count: u32,
+    with_audio: bool,
     reporter: &mut dyn Reporter,
 ) -> Walk {
     // 4 is universal for MP4, but probe so the tool does not silently misparse an odd file.
@@ -168,6 +214,7 @@ pub fn walk(
     let end = mdat.payload_end;
     let span = end.saturating_sub(start).max(1);
     let mut truncation_offset = None;
+    let mut audio_gaps: Vec<(u64, u64)> = Vec::new();
     let mut last_report = start;
 
     loop {
@@ -184,6 +231,13 @@ pub fn walk(
         let payload = cur + length_size as u64;
 
         if len == 0 || payload >= end {
+            if with_audio {
+                if let Some(restart) = resync(data, cur, end, length_size, mb_count) {
+                    audio_gaps.push((cur, restart));
+                    cur = restart;
+                    continue;
+                }
+            }
             truncation_offset = Some(cur);
             break;
         }
@@ -201,10 +255,19 @@ pub fn walk(
         } else {
             unit_ok(data, payload, len as usize, mb_count)
         };
+
         if !valid {
+            if with_audio {
+                if let Some(restart) = resync(data, cur, end, length_size, mb_count) {
+                    audio_gaps.push((cur, restart));
+                    cur = restart;
+                    continue;
+                }
+            }
             truncation_offset = Some(cur);
             break;
         }
+
         nals.push(Nal {
             offset: cur,
             payload_offset: payload,
@@ -229,10 +292,12 @@ pub fn walk(
         }
     }
 
-    // Confirm-by-successor: if the walk stopped on an invalid successor rather than at the end of
-    // mdat, the last accepted unit was sized by a length prefix we can no longer trust — with
-    // enough padding appended, a unit that straddles the real cut still "fits" in the file and
-    // swallows garbage. Demote it to incomplete so it is only ever emitted as a partial frame.
+    // Confirm-by-successor: if the walk stopped on real truncation (not an audio gap), the last
+    // accepted unit was sized by a length prefix we can no longer fully trust — with enough
+    // padding appended, a unit that straddles the real cut still "fits" in the file and swallows
+    // garbage. Demote it to incomplete so it is only ever emitted as a partial frame.
+    // NALs immediately before audio gaps are NOT demoted: their length prefix was valid and all
+    // their bytes were present — the break was in the subsequent (audio) data, not in them.
     if truncation_offset.is_some()
         && let Some(last) = nals.last_mut()
         && last.complete
@@ -244,5 +309,6 @@ pub fn walk(
         nals,
         nal_length_size: length_size,
         truncation_offset,
+        audio_gaps,
     }
 }

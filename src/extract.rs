@@ -16,6 +16,7 @@ pub struct Options {
     pub height: u32,
     pub include_non_idr: bool,
     pub include_partial: bool,
+    pub with_audio: bool,
 }
 
 /// One access unit: the run of VCL NALs belonging to a single picture.
@@ -55,6 +56,7 @@ pub struct Report {
     pub pic_init_qp: i32,
     pub qp_search_attempts: usize,
     pub x264_options_found: bool,
+    pub audio_gaps_skipped: usize,
     pub access_units: usize,
     pub intra_access_units: usize,
     pub frames: Vec<FrameRecord>,
@@ -87,7 +89,7 @@ pub fn extract_with(
 
     let mb_count = opts.width.div_ceil(16) * opts.height.div_ceil(16);
     reporter.phase("walking NAL chain");
-    let walk = nal::walk(data, &mdat, mb_count, reporter);
+    let walk = nal::walk(data, &mdat, mb_count, opts.with_audio, reporter);
     if walk.nals.is_empty() {
         bail!("no NAL units recovered from mdat");
     }
@@ -96,6 +98,12 @@ pub fn extract_with(
         walk.nals.len(),
         walk.nal_length_size
     ));
+    if !walk.audio_gaps.is_empty() {
+        reporter.note(&format!(
+            "skipped {} audio gap(s)",
+            walk.audio_gaps.len()
+        ));
+    }
     if let Some(off) = walk.truncation_offset {
         reporter.note(&format!("chain broke at offset {off} (file is truncated)"));
     } else {
@@ -229,6 +237,7 @@ pub fn extract_with(
         pic_init_qp: params.pic_init_qp,
         qp_search_attempts: qp_attempts,
         x264_options_found,
+        audio_gaps_skipped: walk.audio_gaps.len(),
         access_units: access_units.len(),
         intra_access_units: access_units.iter().filter(|a| a.is_intra).count(),
         frames: records,

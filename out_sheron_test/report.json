@@ -1,0 +1,44 @@
+{
+  "input": "/home/sheron/2026-06-29 12-14-46.mp4",
+  "width": 1920,
+  "height": 1080,
+  "mdat_payload_start": 48,
+  "nal_length_size": 4,
+  "nal_count": 383,
+  "truncation_offset": null,
+  "trusted_data_end": 2208114,
+  "param_source": "in_band",
+  "profile_idc": 100,
+  "pic_init_qp": -1,
+  "qp_search_attempts": 0,
+  "x264_options_found": true,
+  "audio_gaps_skipped": 295,
+  "access_units": 365,
+  "intra_access_units": 3,
+  "frames": [
+    {
+      "index": 0,
+      "offset": 1470,
+      "nal_type": 5,
+      "slice_count": 1,
+      "partial": false,
+      "decoded": true
+    },
+    {
+      "index": 1,
+      "offset": 1826789,
+      "nal_type": 5,
+      "slice_count": 1,
+      "partial": false,
+      "decoded": true
+    },
+    {
+      "index": 2,
+      "offset": 2022924,
+      "nal_type": 5,
+      "slice_count": 1,
+      "partial": false,
+      "decoded": true
+    }
+  ]
+}
