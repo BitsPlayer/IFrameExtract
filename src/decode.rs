@@ -150,3 +150,70 @@ pub fn to_annexb(nals: &[&[u8]]) -> Vec<u8> {
     }
     out
 }
+
+/// Decodes a continuous Annex B H.264 stream into YUV420P frames using ffmpeg if available.
+///
+/// Used for full-stream recovery containing P-frames (including High Profile features like 8x8 DCT
+/// that OpenH264 does not support). Returns an error if ffmpeg is not installed or fails.
+pub fn decode_stream_ffmpeg(annexb: &[u8], width: usize, height: usize) -> Result<Vec<Frame>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-v", "error",
+            "-f", "h264",
+            "-i", "-",
+            "-f", "rawvideo",
+            "-pix_fmt", "yuv420p",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn ffmpeg: {e}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open ffmpeg stdin"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to open ffmpeg stdout"))?;
+
+    let input_bytes = annexb.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input_bytes);
+    });
+
+    use std::io::Read;
+    let mut raw_yuv = Vec::new();
+    stdout
+        .read_to_end(&mut raw_yuv)
+        .map_err(|e| anyhow!("reading ffmpeg output failed: {e}"))?;
+
+    let _ = writer.join();
+    let status = child.wait().map_err(|e| anyhow!("ffmpeg failed: {e}"))?;
+    if !status.success() && raw_yuv.is_empty() {
+        return Err(anyhow!("ffmpeg exited with error: {:?}", status));
+    }
+
+    let frame_bytes = width * height * 3 / 2;
+    if frame_bytes == 0 {
+        return Ok(Vec::new());
+    }
+    let num_frames = raw_yuv.len() / frame_bytes;
+    let mut frames = Vec::with_capacity(num_frames);
+    for i in 0..num_frames {
+        let yuv = raw_yuv[i * frame_bytes..(i + 1) * frame_bytes].to_vec();
+        frames.push(Frame {
+            width,
+            height,
+            yuv,
+        });
+    }
+    Ok(frames)
+}
+
