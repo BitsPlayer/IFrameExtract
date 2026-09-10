@@ -53,10 +53,6 @@ struct Args {
     #[arg(long)]
     include_partial: bool,
 
-    /// Handle interleaved audio in mdat by scanning and resyncing across audio chunks.
-    #[arg(long)]
-    with_audio: bool,
-
     /// Write a JSON report.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -125,7 +121,6 @@ fn main() -> Result<()> {
         height,
         include_non_idr: args.include_non_idr,
         include_partial: args.include_partial,
-        with_audio: args.with_audio,
     };
 
     let name = args.input.display().to_string();
@@ -196,11 +191,11 @@ fn main() -> Result<()> {
             r.pic_init_qp,
             r.qp_search_attempts,
         ));
-        if r.audio_gaps_skipped > 0 {
-            reporter.summary(&format!("skipped {} audio gap(s)", r.audio_gaps_skipped));
-        }
         match r.truncation_offset {
-            Some(off) => reporter.summary(&format!("chain broke at offset {off}")),
+            Some(off) => reporter.summary(&format!(
+                "chain broke at offset {off} ({:.2}% of file)",
+                off as f64 / data.len().max(1) as f64 * 100.0
+            )),
             None => reporter.summary("chain ran cleanly to the end of mdat"),
         }
     }

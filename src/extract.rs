@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::container::find_mdat;
-use crate::decode::{FrameDecoder, Frame, OpenH264Backend, to_annexb};
+use crate::decode::{Frame, FrameDecoder, OpenH264Backend, to_annexb};
 use crate::nal::{self, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SLICE, NAL_SPS, Nal};
 use crate::report::{Reporter, Silent};
 use crate::sei::{X264Options, parse_x264_sei};
@@ -16,7 +16,6 @@ pub struct Options {
     pub height: u32,
     pub include_non_idr: bool,
     pub include_partial: bool,
-    pub with_audio: bool,
 }
 
 /// One access unit: the run of VCL NALs belonging to a single picture.
@@ -33,6 +32,9 @@ pub struct AccessUnit {
 pub struct FrameRecord {
     pub index: usize,
     pub offset: u64,
+    /// Bytes this picture occupies in the source file: every NAL's length prefix plus the payload
+    /// bytes actually present. For a partial picture this is less than the container declares.
+    pub source_size: u64,
     pub nal_type: u8,
     pub slice_count: usize,
     pub partial: bool,
@@ -48,6 +50,10 @@ pub struct Report {
     pub nal_length_size: usize,
     pub nal_count: usize,
     pub truncation_offset: Option<u64>,
+    /// Runs inside `mdat` that are not part of the video chain - the interleaved chunks of another
+    /// track, usually audio - which the walk stepped over.
+    pub skipped_regions: usize,
+    pub skipped_bytes: u64,
     /// End of the last fully received picture. Everything before this is intact data; anything
     /// after it is either the frame straddling the cut or padding.
     pub trusted_data_end: u64,
@@ -56,7 +62,6 @@ pub struct Report {
     pub pic_init_qp: i32,
     pub qp_search_attempts: usize,
     pub x264_options_found: bool,
-    pub audio_gaps_skipped: usize,
     pub access_units: usize,
     pub intra_access_units: usize,
     pub frames: Vec<FrameRecord>,
@@ -89,7 +94,7 @@ pub fn extract_with(
 
     let mb_count = opts.width.div_ceil(16) * opts.height.div_ceil(16);
     reporter.phase("walking NAL chain");
-    let walk = nal::walk(data, &mdat, mb_count, opts.with_audio, reporter);
+    let walk = nal::walk(data, &mdat, mb_count, reporter);
     if walk.nals.is_empty() {
         bail!("no NAL units recovered from mdat");
     }
@@ -98,14 +103,18 @@ pub fn extract_with(
         walk.nals.len(),
         walk.nal_length_size
     ));
-    if !walk.audio_gaps.is_empty() {
+    if walk.skipped_regions > 0 {
         reporter.note(&format!(
-            "skipped {} audio gap(s)",
-            walk.audio_gaps.len()
+            "stepped over {} non-video region(s) totalling {} (interleaved audio or another track)",
+            walk.skipped_regions,
+            crate::report::human_bytes(walk.skipped_bytes),
         ));
     }
     if let Some(off) = walk.truncation_offset {
-        reporter.note(&format!("chain broke at offset {off} (file is truncated)"));
+        reporter.note(&format!(
+            "chain broke at offset {off} ({:.2}% of file; file is truncated)",
+            off as f64 / data.len().max(1) as f64 * 100.0
+        ));
     } else {
         reporter.note("chain ran cleanly to the end of mdat");
     }
@@ -165,7 +174,6 @@ pub fn extract_with(
     reporter.phase("decoding I-frames");
     let mut emitted = 0usize;
     for (i, au) in wanted.iter().enumerate() {
-
         // For a partial picture, hand the decoder only the slices that arrived whole. A slice cut
         // mid-CABAC makes openh264 discard the entire picture, whereas a picture that is merely
         // missing its trailing slices can be concealed, recovering the macroblock rows that did
@@ -196,9 +204,15 @@ pub fn extract_with(
                 None
             }
         };
+        let source_size: u64 = au
+            .nal_indices
+            .iter()
+            .map(|&i| (walk.nal_length_size + walk.nals[i].available_len) as u64)
+            .sum();
         let record = FrameRecord {
             index: emitted,
             offset: au.offset,
+            source_size,
             nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
             slice_count: au.nal_indices.len(),
             partial: !au.complete,
@@ -225,6 +239,8 @@ pub fn extract_with(
         nal_length_size: walk.nal_length_size,
         nal_count: walk.nals.len(),
         truncation_offset: walk.truncation_offset,
+        skipped_regions: walk.skipped_regions,
+        skipped_bytes: walk.skipped_bytes,
         trusted_data_end: access_units
             .iter()
             .filter(|au| au.complete)
@@ -237,7 +253,6 @@ pub fn extract_with(
         pic_init_qp: params.pic_init_qp,
         qp_search_attempts: qp_attempts,
         x264_options_found,
-        audio_gaps_skipped: walk.audio_gaps.len(),
         access_units: access_units.len(),
         intra_access_units: access_units.iter().filter(|a| a.is_intra).count(),
         frames: records,
@@ -334,18 +349,18 @@ fn recover_parameter_sets(
     for (variant, qps) in variants.iter().zip(&qp_lists) {
         for &qp in qps {
             attempts += 1;
-            reporter.progress(
-                attempts as u64,
-                search_len,
-                &format!("trying qp {qp}"),
-            );
+            reporter.progress(attempts as u64, search_len, &format!("trying qp {qp}"));
             let params = synthesize(opts.width, opts.height, variant, qp);
             let Some(au) = probe_au else {
                 // Nothing to validate against; trust the first candidate.
                 return Ok((params, attempts));
             };
 
-            let payloads: Vec<&[u8]> = au.nal_indices.iter().map(|&i| nals[i].payload(data)).collect();
+            let payloads: Vec<&[u8]> = au
+                .nal_indices
+                .iter()
+                .map(|&i| nals[i].payload(data))
+                .collect();
             let mut units: Vec<&[u8]> = vec![&params.sps, &params.pps];
             units.extend_from_slice(&payloads);
 
@@ -436,7 +451,10 @@ mod tests {
         };
         let c = qp_candidates(&opts);
         assert_eq!(c[0], 23, "plain CRF still tries round(crf) first");
-        assert!(c.contains(&26), "stitchable/ABR default must remain reachable");
+        assert!(
+            c.contains(&26),
+            "stitchable/ABR default must remain reachable"
+        );
         assert_eq!(c.len(), 52);
     }
 
