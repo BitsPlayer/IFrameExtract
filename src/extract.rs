@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::container::find_mdat;
-use crate::decode::{Frame, FrameDecoder, OpenH264Backend, to_annexb};
+use crate::decode::{Frame, FrameDecoder, OpenH264Backend, decode_stream_ffmpeg, to_annexb};
 use crate::nal::{self, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SLICE, NAL_SPS, Nal};
 use crate::report::{Reporter, Silent};
 use crate::sei::{X264Options, parse_x264_sei};
@@ -19,6 +19,8 @@ pub struct Options {
     /// Enable two-pass audio-resync walking. Off by default; pass `--with-audio` for files that
     /// interleave an audio track in `mdat`.
     pub with_audio: bool,
+    /// Also recover and decode P-frames (inter-coded pictures), recovering the full video stream.
+    pub all_frames: bool,
 }
 
 /// One access unit: the run of VCL NALs belonging to a single picture.
@@ -163,30 +165,22 @@ pub fn extract_with(
         params.source, params.pic_init_qp, qp_attempts
     ));
 
-    let mut decoder = OpenH264Backend::new(opts.include_partial)?;
     let mut frames = Vec::new();
     let mut records = Vec::new();
-    let mut annexb = to_annexb(&[&params.sps, &params.pps]);
 
     let wanted: Vec<&AccessUnit> = access_units
         .iter()
         .filter(|au| {
-            let keep = au.is_idr || (opts.include_non_idr && au.is_intra);
+            let keep = opts.all_frames || au.is_idr || (opts.include_non_idr && au.is_intra);
             keep && (au.complete || opts.include_partial)
         })
         .collect();
 
-    reporter.phase("decoding I-frames");
-    let mut emitted = 0usize;
-    for (i, au) in wanted.iter().enumerate() {
-        // For a partial picture, hand the decoder only the slices that arrived whole. A slice cut
-        // mid-CABAC makes openh264 discard the entire picture, whereas a picture that is merely
-        // missing its trailing slices can be concealed, recovering the macroblock rows that did
-        // survive.
-        // For a partial picture, hand the decoder only the slices that arrived whole; a slice cut
-        // mid-CABAC is worthless. openh264 still refuses to emit a picture that is missing
-        // slices, so these currently come back undecoded and are reported as such rather than
-        // being invented - see README.
+    let mut annexb = Vec::new();
+    for au in &wanted {
+        if au.is_idr {
+            annexb.extend_from_slice(&to_annexb(&[&params.sps, &params.pps]));
+        }
         let payloads: Vec<&[u8]> = au
             .nal_indices
             .iter()
@@ -194,93 +188,154 @@ pub fn extract_with(
             .filter(|n| au.complete || n.complete)
             .map(|n| n.payload(data))
             .collect();
-        let mut units: Vec<&[u8]> = vec![&params.sps, &params.pps];
-        units.extend_from_slice(&payloads);
-        let au_stream = to_annexb(&units);
         annexb.extend_from_slice(&to_annexb(&payloads));
+    }
 
-        let mut decoded = match decoder.decode_au(&au_stream) {
-            Ok(frame) => frame,
-            Err(_) => {
-                decoder = OpenH264Backend::new(opts.include_partial)?;
-                None
+    let phase = if opts.all_frames {
+        "decoding frames (I + P)"
+    } else {
+        "decoding I-frames"
+    };
+    reporter.phase(phase);
+
+    let mut stream_frames: Option<Vec<Frame>> = None;
+    if opts.all_frames {
+        if let Ok(df) = decode_stream_ffmpeg(&annexb, opts.width as usize, opts.height as usize) {
+            if !df.is_empty() {
+                stream_frames = Some(df);
             }
-        };
+        }
+    }
 
-        let mut frame_sps_profile = None;
-        if decoded.is_none()
-            && (params.source == ParamSource::Synthesized
-                || params.source == ParamSource::SynthesizedHardware)
-        {
-            for variant in option_variants(&x264_opts) {
-                for qp in qp_candidates(&x264_opts) {
-                    let candidate = synthesize(opts.width, opts.height, &variant, qp);
-                    let mut probe_units: Vec<&[u8]> = vec![&candidate.sps, &candidate.pps];
-                    probe_units.extend_from_slice(&payloads);
-                    let mut probe_dec = OpenH264Backend::new(false)?;
-                    if let Ok(Some(f)) = probe_dec.decode_au(&to_annexb(&probe_units)) {
-                        decoded = Some(f);
-                        frame_sps_profile = Some("x264".to_string());
+    if let Some(df) = stream_frames {
+        let mut df_iter = df.into_iter();
+        for (i, au) in wanted.iter().enumerate() {
+            let frame = df_iter.next();
+            let source_size: u64 = au
+                .nal_indices
+                .iter()
+                .map(|&idx| (walk.nal_length_size + walk.nals[idx].available_len) as u64)
+                .sum();
+            let record = FrameRecord {
+                index: i,
+                offset: au.offset,
+                source_size,
+                nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
+                slice_count: au.nal_indices.len(),
+                partial: !au.complete,
+                decoded: frame.is_some(),
+                sps_profile: None,
+            };
+            records.push(record.clone());
+            if let Some(f) = frame {
+                frames.push((record, f));
+            }
+            reporter.progress(
+                (i + 1) as u64,
+                wanted.len() as u64,
+                &format!("frame {}/{}  off {}", i + 1, wanted.len(), au.offset),
+            );
+        }
+    } else {
+        let mut decoder = OpenH264Backend::new(opts.include_partial)?;
+        let mut emitted = 0usize;
+        for (i, au) in wanted.iter().enumerate() {
+            let payloads: Vec<&[u8]> = au
+                .nal_indices
+                .iter()
+                .map(|&i| &walk.nals[i])
+                .filter(|n| au.complete || n.complete)
+                .map(|n| n.payload(data))
+                .collect();
+            let mut units: Vec<&[u8]> = vec![&params.sps, &params.pps];
+            units.extend_from_slice(&payloads);
+            let au_stream = to_annexb(&units);
+
+            let mut decoded = match decoder.decode_au(&au_stream) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    decoder = OpenH264Backend::new(opts.include_partial)?;
+                    None
+                }
+            };
+
+            let mut frame_sps_profile = None;
+            if decoded.is_none()
+                && (params.source == ParamSource::Synthesized
+                    || params.source == ParamSource::SynthesizedHardware)
+            {
+                for variant in option_variants(&x264_opts) {
+                    for qp in qp_candidates(&x264_opts) {
+                        let candidate = synthesize(opts.width, opts.height, &variant, qp);
+                        let mut probe_units: Vec<&[u8]> = vec![&candidate.sps, &candidate.pps];
+                        probe_units.extend_from_slice(&payloads);
+                        let mut probe_dec = OpenH264Backend::new(false)?;
+                        if let Ok(Some(f)) = probe_dec.decode_au(&to_annexb(&probe_units)) {
+                            decoded = Some(f);
+                            frame_sps_profile = Some("x264".to_string());
+                            break;
+                        }
+                    }
+                    if decoded.is_some() {
                         break;
                     }
                 }
-                if decoded.is_some() {
-                    break;
-                }
-            }
 
-            if decoded.is_none() {
-                let hw_qps = hardware_qp_candidates();
-                let hw_profiles = hardware_profile_variants();
-                let hw_base = X264Options {
-                    bframes: 0,
-                    b_pyramid: 0,
-                    ..x264_opts.clone()
-                };
-                let hw_opts_variants = hardware_opts_variants(&hw_base);
-                'hw_retry: for profile in &hw_profiles {
-                    for hw_opts in &hw_opts_variants {
-                        for &qp in &hw_qps {
-                            let candidate =
-                                synthesize_profile(opts.width, opts.height, hw_opts, qp, *profile);
-                            let mut probe_units: Vec<&[u8]> = vec![&candidate.sps, &candidate.pps];
-                            probe_units.extend_from_slice(&payloads);
-                            let mut probe_dec = OpenH264Backend::new(false)?;
-                            if let Ok(Some(f)) = probe_dec.decode_au(&to_annexb(&probe_units)) {
-                                decoded = Some(f);
-                                frame_sps_profile = Some(profile.label());
-                                break 'hw_retry;
+                if decoded.is_none() {
+                    let hw_qps = hardware_qp_candidates();
+                    let hw_profiles = hardware_profile_variants();
+                    let hw_base = X264Options {
+                        bframes: 0,
+                        b_pyramid: 0,
+                        weighted_pred: false,
+                        weighted_bipred: false,
+                        ..x264_opts.clone()
+                    };
+                    let hw_opts_variants = hardware_opts_variants(&hw_base);
+                    'hw_retry: for profile in &hw_profiles {
+                        for hw_opts in &hw_opts_variants {
+                            for &qp in &hw_qps {
+                                let candidate =
+                                    synthesize_profile(opts.width, opts.height, hw_opts, qp, *profile);
+                                let mut probe_units: Vec<&[u8]> = vec![&candidate.sps, &candidate.pps];
+                                probe_units.extend_from_slice(&payloads);
+                                let mut probe_dec = OpenH264Backend::new(false)?;
+                                if let Ok(Some(f)) = probe_dec.decode_au(&to_annexb(&probe_units)) {
+                                    decoded = Some(f);
+                                    frame_sps_profile = Some(profile.label());
+                                    break 'hw_retry;
+                                }
                             }
                         }
                     }
                 }
             }
+            let source_size: u64 = au
+                .nal_indices
+                .iter()
+                .map(|&i| (walk.nal_length_size + walk.nals[i].available_len) as u64)
+                .sum();
+            let record = FrameRecord {
+                index: emitted,
+                offset: au.offset,
+                source_size,
+                nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
+                slice_count: au.nal_indices.len(),
+                partial: !au.complete,
+                decoded: decoded.is_some(),
+                sps_profile: frame_sps_profile,
+            };
+            records.push(record.clone());
+            if let Some(frame) = decoded {
+                frames.push((record, frame));
+            }
+            emitted += 1;
+            reporter.progress(
+                (i + 1) as u64,
+                wanted.len() as u64,
+                &format!("frame {}/{}  off {}", i + 1, wanted.len(), au.offset),
+            );
         }
-        let source_size: u64 = au
-            .nal_indices
-            .iter()
-            .map(|&i| (walk.nal_length_size + walk.nals[i].available_len) as u64)
-            .sum();
-        let record = FrameRecord {
-            index: emitted,
-            offset: au.offset,
-            source_size,
-            nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
-            slice_count: au.nal_indices.len(),
-            partial: !au.complete,
-            decoded: decoded.is_some(),
-            sps_profile: frame_sps_profile,
-        };
-        records.push(record.clone());
-        if let Some(frame) = decoded {
-            frames.push((record, frame));
-        }
-        emitted += 1;
-        reporter.progress(
-            (i + 1) as u64,
-            wanted.len() as u64,
-            &format!("frame {}/{}  off {}", i + 1, wanted.len(), au.offset),
-        );
     }
     reporter.finish_phase(&format!("{} of {} decoded", frames.len(), wanted.len()));
 
@@ -441,7 +496,13 @@ fn recover_parameter_sets(
     if !probe_aus.is_empty() {
         let hw_qps = hardware_qp_candidates();
         let hw_profiles = hardware_profile_variants();
-        let hw_base = X264Options { bframes: 0, b_pyramid: 0, ..x264_opts.clone() };
+        let hw_base = X264Options {
+            bframes: 0,
+            b_pyramid: 0,
+            weighted_pred: false,
+            weighted_bipred: false,
+            ..x264_opts.clone()
+        };
         let hw_opts_variants = hardware_opts_variants(&hw_base);
         let hw_total = (hw_profiles.len() * hw_opts_variants.len() * hw_qps.len()) as u64;
         reporter.note("x264 search exhausted; trying hardware encoder profiles");

@@ -58,6 +58,14 @@ struct Args {
     #[arg(long)]
     with_audio: bool,
 
+    /// Also recover and decode P-frames (inter-coded pictures), recovering the full video stream.
+    #[arg(long)]
+    all_frames: bool,
+
+    /// Also remux the recovered stream into a standard MP4 video (<output>/recovered.mp4). Requires ffmpeg.
+    #[arg(long)]
+    mp4: bool,
+
     /// Write a JSON report.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -131,6 +139,7 @@ fn main() -> Result<()> {
         include_non_idr: args.include_non_idr,
         include_partial: args.include_partial,
         with_audio: args.with_audio,
+        all_frames: args.all_frames,
     };
 
     let name = args.input.display().to_string();
@@ -191,6 +200,23 @@ fn main() -> Result<()> {
         reporter.note(&format!("writing Annex B stream to {}", path.display()));
         std::fs::write(path, &result.annexb)
             .with_context(|| format!("writing {}", path.display()))?;
+
+        if args.mp4 || args.all_frames {
+            let mp4_path = args.output.join("recovered.mp4");
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v", "error",
+                    "-r", "30",
+                    "-i", &path.to_string_lossy(),
+                    "-c", "copy",
+                    &mp4_path.to_string_lossy(),
+                ])
+                .status();
+            if let Ok(s) = status && s.success() {
+                reporter.note(&format!("wrote MP4 video to {}", mp4_path.display()));
+            }
+        }
     }
 
     if let Some(path) = &args.json {

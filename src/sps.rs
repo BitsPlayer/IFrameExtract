@@ -171,8 +171,17 @@ pub fn synthesize_profile(
         w.ue(log2_max_poc_lsb_minus4);
     }
     // poc_type 1 would require delta_pic_order_always_zero_flag + offsets — never synthesised.
-    // poc_type 2 needs no additional fields.
-    w.ue(max_num_ref_frames(opts));
+    let max_refs = match encoder_profile {
+        EncoderProfile::AndroidQualcomm | EncoderProfile::AppleAVFoundation => {
+            if opts.bframes == 0 {
+                1
+            } else {
+                max_num_ref_frames(opts)
+            }
+        }
+        _ => max_num_ref_frames(opts),
+    };
+    w.ue(max_refs);
     w.flag(false); // gaps_in_frame_num_value_allowed_flag
     w.ue(mb_w - 1);
     w.ue(mb_h - 1);
@@ -199,11 +208,19 @@ pub fn synthesize_profile(
     p.flag(false); // bottom_field_pic_order_in_frame_present_flag
     p.ue(0); // num_slice_groups_minus1
     p.ue(opts.refs.saturating_sub(1)); // num_ref_idx_l0_default_active_minus1
-    p.ue(0); // num_ref_idx_l1_default_active_minus1
+    let ref_l1 = match encoder_profile {
+        EncoderProfile::X264 => 0,
+        _ => opts.refs.saturating_sub(1),
+    };
+    p.ue(ref_l1); // num_ref_idx_l1_default_active_minus1
     p.flag(opts.weighted_pred);
     p.u(2, if opts.weighted_bipred { 2 } else { 0 });
     p.se(pic_init_qp - 26);
-    p.se(0); // pic_init_qs_minus26
+    let qs = match encoder_profile {
+        EncoderProfile::X264 => 0,
+        _ => pic_init_qp - 26,
+    };
+    p.se(qs); // pic_init_qs_minus26
     p.se(opts.chroma_qp_offset);
     p.flag(true); // deblocking_filter_control_present_flag
     p.flag(opts.constrained_intra);
