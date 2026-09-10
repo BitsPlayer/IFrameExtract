@@ -139,12 +139,14 @@ const GAP_CEILING: u64 = 256 * 1024;
 /// its chunk scale, a gap many times wider is padding rather than another chunk.
 const GAP_HEADROOM: u64 = 8;
 
+const GAP_FLOOR: u64 = 64 * 1024;
+
 /// How far the next gap may run, given the widest crossed so far. Before any has been crossed
 /// there is nothing to go on and the ceiling stands.
 fn gap_limit(widest: u64) -> u64 {
     match widest {
         0 => GAP_CEILING,
-        w => w.saturating_mul(GAP_HEADROOM).min(GAP_CEILING),
+        w => w.saturating_mul(GAP_HEADROOM).clamp(GAP_FLOOR, GAP_CEILING),
     }
 }
 
