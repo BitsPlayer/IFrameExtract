@@ -53,13 +53,22 @@ struct Args {
     #[arg(long)]
     include_partial: bool,
 
+    /// Enable audio-aware walking for files that interleave an audio track in mdat. Adds a
+    /// second resync pass that steps over non-video regions. Not needed for video-only files.
+    #[arg(long)]
+    with_audio: bool,
+
     /// Write a JSON report.
     #[arg(long)]
     json: Option<PathBuf>,
 
-    /// Write the recovered Annex B elementary stream, for cross-checking with other decoders.
+    /// Write the recovered Annex B elementary stream to a custom path (defaults to <output>/recovered.264).
     #[arg(long)]
     emit_annexb: Option<PathBuf>,
+
+    /// Do not write the recovered Annex B stream file.
+    #[arg(long)]
+    no_annexb: bool,
 
     /// Print nothing on success.
     #[arg(short, long)]
@@ -121,6 +130,7 @@ fn main() -> Result<()> {
         height,
         include_non_idr: args.include_non_idr,
         include_partial: args.include_partial,
+        with_audio: args.with_audio,
     };
 
     let name = args.input.display().to_string();
@@ -168,7 +178,16 @@ fn main() -> Result<()> {
     }
     reporter.finish_phase(&format!("{nframes} files in {}", args.output.display()));
 
-    if let Some(path) = &args.emit_annexb {
+    let annexb_path = if args.no_annexb {
+        None
+    } else {
+        Some(
+            args.emit_annexb
+                .clone()
+                .unwrap_or_else(|| args.output.join("recovered.264")),
+        )
+    };
+    if let Some(path) = &annexb_path {
         reporter.note(&format!("writing Annex B stream to {}", path.display()));
         std::fs::write(path, &result.annexb)
             .with_context(|| format!("writing {}", path.display()))?;

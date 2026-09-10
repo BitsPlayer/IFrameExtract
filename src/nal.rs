@@ -139,12 +139,14 @@ const GAP_CEILING: u64 = 256 * 1024;
 /// its chunk scale, a gap many times wider is padding rather than another chunk.
 const GAP_HEADROOM: u64 = 8;
 
+const GAP_FLOOR: u64 = 64 * 1024;
+
 /// How far the next gap may run, given the widest crossed so far. Before any has been crossed
 /// there is nothing to go on and the ceiling stands.
 fn gap_limit(widest: u64) -> u64 {
     match widest {
         0 => GAP_CEILING,
-        w => w.saturating_mul(GAP_HEADROOM).min(GAP_CEILING),
+        w => w.saturating_mul(GAP_HEADROOM).clamp(GAP_FLOOR, GAP_CEILING),
     }
 }
 
@@ -349,9 +351,15 @@ fn skip_non_video(
 /// file's padding invites: fabricated units that drag the chain past the real cut. The two are
 /// told apart by result rather than by heuristic - on an interleaved file skipping unlocks the
 /// whole video, while in padding it scrapes together a handful of extra units.
-pub fn walk(data: &[u8], mdat: &MdatRange, mb_count: u32, reporter: &mut dyn Reporter) -> Walk {
+pub fn walk(
+    data: &[u8],
+    mdat: &MdatRange,
+    mb_count: u32,
+    with_audio: bool,
+    reporter: &mut dyn Reporter,
+) -> Walk {
     let plain = walk_once(data, mdat, mb_count, reporter, false);
-    if plain.truncation_offset.is_none() {
+    if !with_audio || plain.truncation_offset.is_none() {
         return plain;
     }
     let skipped = walk_once(data, mdat, mb_count, &mut Silent, true);
@@ -578,7 +586,7 @@ mod tests {
             payload_end: data.len() as u64,
             complete,
         };
-        walk(data, &mdat, MB_COUNT, &mut Silent)
+        walk(data, &mdat, MB_COUNT, true, &mut Silent)
     }
 
     #[test]

@@ -8,6 +8,10 @@
 //! files: `log2_max_frame_num` is 4 everywhere regardless of keyint, `poc_type` is 0 (lsb 6)
 //! unless there are no B-frames, in which case it is 2, scaling matrices are never present and
 //! `gaps_in_frame_num_value_allowed` is always 0.
+//!
+//! Hardware encoders (Android/Qualcomm, Apple AVFoundation) use wider `frame_num` fields and
+//! different POC types. `EncoderProfile` captures these differences so that the synthesis search
+//! can sweep hardware profiles when the x264 path fails.
 
 use crate::bits::{BitWriter, escape_rbsp};
 use crate::sei::X264Options;
@@ -27,6 +31,70 @@ pub enum ParamSource {
     InBand,
     /// Reconstructed from resolution + x264 SEI options.
     Synthesized,
+    /// Reconstructed using a hardware encoder profile (no x264 SEI available).
+    SynthesizedHardware,
+}
+
+/// Which encoder produced the stream — controls the SPS fields that differ between implementations.
+///
+/// All hardware profiles assume no B-frames (poc_type 2 or 0 without reorder) and no 8x8 DCT
+/// unless the opts say otherwise. The key differentiator is `log2_max_frame_num_minus4` which
+/// determines how many bits the decoder must read for `frame_num` on every slice header. Getting
+/// this wrong shifts every bit after the first frame and causes systematic decode failures on
+/// frames 1+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderProfile {
+    /// x264 / libx264: `log2_max_frame_num_minus4 = 0` (4-bit frame_num).
+    /// poc_type is driven by the x264 SEI (0 with B-frames, 2 without).
+    X264,
+    /// Android Qualcomm / MediaCodec (e.g. LG M250, Samsung phones).
+    /// `log2_max_frame_num_minus4 = 10` → 14-bit frame_num, poc_type 2.
+    AndroidQualcomm,
+    /// Apple AVFoundation (iPhone, iPad).
+    /// `log2_max_frame_num_minus4 = 4` → 8-bit frame_num, poc_type 0.
+    AppleAVFoundation,
+    /// Explicit sweep entry — used when neither known profile matches.
+    Generic {
+        log2_max_frame_num_minus4: u32,
+        poc_type: u32,
+    },
+}
+
+impl EncoderProfile {
+    /// Human-readable label used in diagnostic output.
+    pub fn label(self) -> String {
+        match self {
+            Self::X264 => "x264".into(),
+            Self::AndroidQualcomm => "android-qualcomm".into(),
+            Self::AppleAVFoundation => "apple-avfoundation".into(),
+            Self::Generic { log2_max_frame_num_minus4: f, poc_type: p } => {
+                format!("generic(frame_num_bits={},poc_type={})", f + 4, p)
+            }
+        }
+    }
+
+    /// Return `(log2_max_frame_num_minus4, poc_type, log2_max_poc_lsb_minus4)`.
+    ///
+    /// The third element is the value written for `log2_max_pic_order_cnt_lsb_minus4`
+    /// when `poc_type == 0`. x264 always writes `2` (→ 6-bit POC LSB) regardless of
+    /// `log2_max_frame_num`; hardware encoders typically set it equal to
+    /// `log2_max_frame_num_minus4` (e.g. LG M250: both 12 → 16-bit fields).
+    fn frame_num_and_poc(self, opts: &X264Options) -> (u32, u32, u32) {
+        match self {
+            // x264: log2_max_frame_num=0, poc driven by bframes, poc_lsb always 2.
+            Self::X264 => (0, if opts.bframes > 0 { 0 } else { 2 }, 2),
+            // Android Qualcomm — real-world value from LG M250 companion SPS:
+            // log2_max_frame_num_minus4=12, poc_type=0, poc_lsb_minus4=12.
+            // (Our earlier assumption of 10/poc_type=2 was wrong; real value is 12/0.)
+            Self::AndroidQualcomm => (12, 0, 12),
+            // Apple AVFoundation: 4-bit frame_num, poc_type 0.
+            Self::AppleAVFoundation => (4, 0, 4),
+            Self::Generic { log2_max_frame_num_minus4, poc_type } => {
+                // Hardware pattern: poc_lsb matches frame_num bit-width.
+                (log2_max_frame_num_minus4, poc_type, log2_max_frame_num_minus4)
+            }
+        }
+    }
 }
 
 pub const PROFILE_BASELINE: u32 = 66;
@@ -47,23 +115,49 @@ pub fn profile_for(opts: &X264Options) -> u32 {
 /// the decoder never rejects the stream.
 const LEVEL_IDC: u32 = 51;
 
+/// Synthesise SPS/PPS for the x264 encoder profile.
+///
+/// This is the original entry point; all existing callers are unaffected. It delegates to
+/// `synthesize_profile` with `EncoderProfile::X264` and overrides the source tag back to
+/// `Synthesized` so that the JSON report and existing tests remain unchanged.
 pub fn synthesize(width: u32, height: u32, opts: &X264Options, pic_init_qp: i32) -> ParameterSets {
-    let profile = profile_for(opts);
+    let mut ps = synthesize_profile(width, height, opts, pic_init_qp, EncoderProfile::X264);
+    ps.source = ParamSource::Synthesized;
+    ps
+}
+
+/// Synthesise SPS/PPS for an arbitrary encoder profile.
+///
+/// The `opts` fields that are x264-specific (cabac, refs, bframes, transform_8x8, etc.) are still
+/// used for the PPS and for H.264 profile selection; only the SPS `log2_max_frame_num_minus4` and
+/// `pic_order_cnt_type` are overridden by `encoder_profile`. This lets the hardware sweep reuse
+/// the same QP search loop that the x264 path already has.
+pub fn synthesize_profile(
+    width: u32,
+    height: u32,
+    opts: &X264Options,
+    pic_init_qp: i32,
+    encoder_profile: EncoderProfile,
+) -> ParameterSets {
+    let h264_profile = profile_for(opts);
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
     // CropUnitX/Y are 2/2 for 4:2:0 with frame_mbs_only_flag = 1.
     let crop_right = (mb_w * 16 - width) / 2;
     let crop_bottom = (mb_h * 16 - height) / 2;
 
+    let (log2_max_frame_num_minus4, poc_type, log2_max_poc_lsb_minus4) =
+        encoder_profile.frame_num_and_poc(opts);
+
     let mut w = BitWriter::new();
     w.u(8, 0x67); // nal_ref_idc = 3, nal_unit_type = 7
-    w.u(8, profile);
+    w.u(8, h264_profile);
     // constraint_set flags: mark Constrained Baseline when that is what we claim.
-    w.u(8, if profile == PROFILE_BASELINE { 0x40 } else { 0x00 });
+    w.u(8, if h264_profile == PROFILE_BASELINE { 0x40 } else { 0x00 });
     w.u(8, LEVEL_IDC);
     w.ue(0); // seq_parameter_set_id
 
-    if profile == PROFILE_HIGH {
+    if h264_profile == PROFILE_HIGH {
         w.ue(1); // chroma_format_idc = 4:2:0
         w.ue(0); // bit_depth_luma_minus8
         w.ue(0); // bit_depth_chroma_minus8
@@ -71,13 +165,13 @@ pub fn synthesize(width: u32, height: u32, opts: &X264Options, pic_init_qp: i32)
         w.flag(false); // seq_scaling_matrix_present_flag
     }
 
-    w.ue(0); // log2_max_frame_num_minus4 -> 4
-    if opts.bframes > 0 {
-        w.ue(0); // pic_order_cnt_type
-        w.ue(2); // log2_max_pic_order_cnt_lsb_minus4 -> 6
-    } else {
-        w.ue(2); // pic_order_cnt_type = 2
+    w.ue(log2_max_frame_num_minus4);
+    w.ue(poc_type); // pic_order_cnt_type
+    if poc_type == 0 {
+        w.ue(log2_max_poc_lsb_minus4);
     }
+    // poc_type 1 would require delta_pic_order_always_zero_flag + offsets — never synthesised.
+    // poc_type 2 needs no additional fields.
     w.ue(max_num_ref_frames(opts));
     w.flag(false); // gaps_in_frame_num_value_allowed_flag
     w.ue(mb_w - 1);
@@ -114,7 +208,7 @@ pub fn synthesize(width: u32, height: u32, opts: &X264Options, pic_init_qp: i32)
     p.flag(true); // deblocking_filter_control_present_flag
     p.flag(opts.constrained_intra);
     p.flag(false); // redundant_pic_cnt_present_flag
-    if profile == PROFILE_HIGH {
+    if h264_profile == PROFILE_HIGH {
         p.flag(opts.transform_8x8);
         p.flag(false); // pic_scaling_matrix_present_flag
         p.se(opts.chroma_qp_offset); // second_chroma_qp_index_offset
@@ -125,7 +219,7 @@ pub fn synthesize(width: u32, height: u32, opts: &X264Options, pic_init_qp: i32)
     ParameterSets {
         sps,
         pps,
-        source: ParamSource::Synthesized,
+        source: ParamSource::SynthesizedHardware,
         pic_init_qp,
     }
 }
@@ -171,5 +265,57 @@ mod tests {
         assert_eq!(max_num_ref_frames(&opts(5, 3, 2)), 5);
         assert_eq!(max_num_ref_frames(&opts(3, 0, 0)), 3);
         assert_eq!(max_num_ref_frames(&opts(4, 3, 1)), 3); // strict pyramid drops one
+    }
+
+    #[test]
+    fn synthesize_source_tag_is_synthesized() {
+        // synthesize() must keep the original ParamSource::Synthesized tag so that existing
+        // callers and JSON reports are unaffected.
+        let o = X264Options::default();
+        let ps = synthesize(1280, 720, &o, 26);
+        assert_eq!(ps.source, ParamSource::Synthesized);
+        assert_eq!(ps.sps[0], 0x67);
+    }
+
+    #[test]
+    fn synthesize_profile_hardware_differs_from_x264() {
+        // Hardware profiles must produce different SPS bytes (wider frame_num field).
+        // Use bframes=0 opts so X264 picks poc_type=2 (same as Generic{0,2}) — the only
+        // difference then is log2_max_frame_num_minus4.
+        let o = X264Options {
+            bframes: 0,
+            b_pyramid: 0,
+            cabac: false,
+            transform_8x8: false,
+            ..X264Options::default()
+        };
+        let x264_ps = synthesize(1280, 720, &o, 26);
+        let hw_ps = synthesize_profile(1280, 720, &o, 26, EncoderProfile::AndroidQualcomm);
+
+        assert_ne!(x264_ps.sps, hw_ps.sps, "Qualcomm SPS must differ (frame_num bits=14)");
+        assert_eq!(hw_ps.source, ParamSource::SynthesizedHardware);
+
+        // Generic with the same log2_max_frame_num_minus4 and poc_type as X264 (both=0 and 2
+        // for no-bframe opts) must produce identical SPS bytes.
+        let generic_eq = synthesize_profile(
+            1280,
+            720,
+            &o,
+            26,
+            EncoderProfile::Generic { log2_max_frame_num_minus4: 0, poc_type: 2 },
+        );
+        assert_eq!(
+            x264_ps.sps, generic_eq.sps,
+            "Generic(0,2) must match x264 SPS for no-bframe opts"
+        );
+    }
+
+    #[test]
+    fn encoder_profile_labels_are_non_empty() {
+        assert_eq!(EncoderProfile::X264.label(), "x264");
+        assert_eq!(EncoderProfile::AndroidQualcomm.label(), "android-qualcomm");
+        assert_eq!(EncoderProfile::AppleAVFoundation.label(), "apple-avfoundation");
+        let label = EncoderProfile::Generic { log2_max_frame_num_minus4: 6, poc_type: 2 }.label();
+        assert!(!label.is_empty());
     }
 }

@@ -1,2 +1,7 @@
-/target
-/out
+/target/
+/out/
+/out_*/
+*.png
+*.yuv
+*.264
+*.json
