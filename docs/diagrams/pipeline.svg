@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" role="img">
+  <title>Carve pipeline</title>
+  <desc>Find mdat, walk the AVCC NAL chain, recover parameter sets, group access units, then decode.</desc>
+  <defs>
+    <marker id="link" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#3d6b7a"/>
+    </marker>
+  </defs>
+  <rect width="960" height="520" fill="#f4f1ea"/>
+  <text x="40" y="42" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="650">Carve pipeline</text>
+  <text x="40" y="66" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Declared box sizes are clamped to the bytes that are actually present.</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="40" y="100" width="168" height="96" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="56" y="134" fill="#1c1915" font-size="15" font-weight="650">Find mdat</text>
+    <text x="56" y="158" fill="#6b645c" font-size="12">Skip every other box.</text>
+    <text x="56" y="176" fill="#6b645c" font-size="12">Clamp a short file.</text>
+
+    <line x1="208" y1="148" x2="248" y2="148" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#link)"/>
+
+    <rect x="248" y="100" width="200" height="96" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="264" y="134" fill="#1c1915" font-size="15" font-weight="650">Walk AVCC</text>
+    <text x="264" y="158" fill="#6b645c" font-size="12">Length prefix, then NAL.</text>
+    <text x="264" y="176" fill="#6b645c" font-size="12">Stop when a unit fails.</text>
+
+    <line x1="448" y1="148" x2="488" y2="148" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#link)"/>
+
+    <rect x="488" y="100" width="200" height="96" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="504" y="134" fill="#1c1915" font-size="15" font-weight="650">Parameter sets</text>
+    <text x="504" y="158" fill="#6b645c" font-size="12">In-band SPS/PPS, or</text>
+    <text x="504" y="176" fill="#6b645c" font-size="12">synthesised from SEI.</text>
+
+    <line x1="688" y1="148" x2="728" y2="148" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#link)"/>
+
+    <rect x="728" y="100" width="192" height="96" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="744" y="134" fill="#1c1915" font-size="15" font-weight="650">Access units</text>
+    <text x="744" y="158" fill="#6b645c" font-size="12">A slice at macroblock</text>
+    <text x="744" y="176" fill="#6b645c" font-size="12">zero starts a picture.</text>
+  </g>
+
+  <line x1="824" y1="196" x2="824" y2="248" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#link)"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="40" y="248" width="880" height="100" rx="12" fill="#eef3f4" stroke="#c5d4d8"/>
+    <text x="60" y="282" fill="#1c1915" font-size="15" font-weight="650">Decode with openh264</text>
+    <text x="60" y="308" fill="#6b645c" font-size="13">Each kept access unit is Annex B. The first IDR is used to test pic_init_qp.</text>
+    <text x="60" y="328" fill="#6b645c" font-size="13">A picture is trusted when the chain has already moved on to the next one.</text>
+  </g>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="40" y="380" width="270" height="88" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="56" y="414" fill="#1c1915" font-size="15" font-weight="650">PNG or YUV</text>
+    <text x="56" y="438" fill="#6b645c" font-size="12">frame_00007_off_0000151793</text>
+    <text x="56" y="456" fill="#6b645c" font-size="12">Partial frames keep the suffix.</text>
+
+    <rect x="344" y="380" width="270" height="88" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="360" y="414" fill="#1c1915" font-size="15" font-weight="650">recovered.264</text>
+    <text x="360" y="438" fill="#6b645c" font-size="12">Annex B of the kept units.</text>
+    <text x="360" y="456" fill="#6b645c" font-size="12">--no-annexb skips the file.</text>
+
+    <rect x="648" y="380" width="272" height="88" rx="10" fill="#f8f1e3" stroke="#e4d3b0"/>
+    <text x="664" y="414" fill="#1c1915" font-size="15" font-weight="650">recovered.mp4</text>
+    <text x="664" y="438" fill="#6b645c" font-size="12">ffmpeg remux when --mp4 or</text>
+    <text x="664" y="456" fill="#6b645c" font-size="12">--all-frames is set.</text>
+  </g>
+</svg>

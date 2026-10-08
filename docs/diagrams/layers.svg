@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" role="img">
+  <title>iframe-extract layers</title>
+  <desc>The CLI calls the extract use case. Domain code parses bytes. Infrastructure supplies the openh264 decoder.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#3d6b7a"/>
+    </marker>
+  </defs>
+  <rect width="960" height="560" fill="#f4f1ea"/>
+  <text x="40" y="42" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="650">Layers</text>
+  <text x="40" y="66" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Parsing stays free of the decoder. The decoder stays behind a port.</text>
+
+  <rect x="40" y="92" width="880" height="100" rx="12" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="60" y="120" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">PRESENTATION</text>
+  <text x="60" y="148" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">CLI</text>
+  <text x="60" y="170" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Reads the file, parses flags, writes PNG, YUV, Annex B, JSON, and optional MP4</text>
+
+  <line x1="480" y1="192" x2="480" y2="220" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="220" width="880" height="100" rx="12" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="60" y="248" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">APPLICATION</text>
+  <text x="60" y="276" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">extract_with_decoder</text>
+  <text x="60" y="298" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Orders the carve, groups access units, and asks the VideoDecoder port for pictures</text>
+
+  <line x1="280" y1="320" x2="280" y2="348" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="700" y1="320" x2="700" y2="348" stroke="#3d6b7a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="348" width="430" height="120" rx="12" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="60" y="376" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">DOMAIN</text>
+  <text x="60" y="406" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">Bytes in, structures out</text>
+  <text x="60" y="430" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">mdat range, NAL walk, SEI, SPS synthesis,</text>
+  <text x="60" y="448" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">slice headers, Annex B</text>
+
+  <rect x="490" y="348" width="430" height="120" rx="12" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="510" y="376" fill="#3d6b7a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="650">INFRASTRUCTURE</text>
+  <text x="510" y="406" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">openh264</text>
+  <text x="510" y="430" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Implements FrameDecoder. A wrong parameter</text>
+  <text x="510" y="448" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">set fails the decode instead of inventing pixels.</text>
+
+  <text x="40" y="520" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">BitsPlayer calls the library. The same use case runs from this crate's CLI.</text>
+</svg>

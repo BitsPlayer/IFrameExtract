@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" role="img">
+  <title>Recover frames from an MP4</title>
+  <desc>Give iframe-extract a file and a frame size. It carves mdat, decodes the pictures that survive, and writes frames named by byte offset.</desc>
+  <rect width="960" height="560" fill="#f4f1ea"/>
+  <text x="40" y="44" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="650">Recover frames</text>
+  <text x="40" y="68" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">The index in moov is ignored. The bytes in mdat are the evidence.</text>
+
+  <line x1="78" y1="104" x2="78" y2="500" stroke="#d9d3c7" stroke-width="2"/>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <circle cx="78" cy="120" r="14" fill="#3d6b7a"/>
+    <text x="78" y="125" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">1</text>
+    <rect x="112" y="92" width="400" height="72" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="132" y="122" fill="#1c1915" font-size="15" font-weight="650">Start from the file you have</text>
+    <text x="132" y="144" fill="#6b645c" font-size="13">Intact or cut off at the tail. ftyp and mdat must remain.</text>
+
+    <circle cx="78" cy="220" r="14" fill="#3d6b7a"/>
+    <text x="78" y="225" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">2</text>
+    <rect x="112" y="188" width="400" height="88" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="132" y="218" fill="#1c1915" font-size="15" font-weight="650">Tell it the picture size</text>
+    <text x="132" y="240" fill="#6b645c" font-size="13">--size WIDTHxHEIGHT. Add --matrix when PNG colour</text>
+    <text x="132" y="258" fill="#6b645c" font-size="13">matters. Both normally lived in the lost SPS.</text>
+
+    <circle cx="78" cy="336" r="14" fill="#3d6b7a"/>
+    <text x="78" y="341" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">3</text>
+    <rect x="112" y="300" width="400" height="88" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+    <text x="132" y="330" fill="#1c1915" font-size="15" font-weight="650">Carve and decode</text>
+    <text x="132" y="352" fill="#6b645c" font-size="13">Walk the length-prefixed NAL chain inside mdat.</text>
+    <text x="132" y="370" fill="#6b645c" font-size="13">Stop at the first unit that fails validation.</text>
+
+    <circle cx="78" cy="452" r="14" fill="#8a5a12"/>
+    <text x="78" y="457" text-anchor="middle" fill="#fffcf7" font-size="12" font-weight="650">4</text>
+    <rect x="112" y="412" width="400" height="88" rx="10" fill="#fffcf7" stroke="#e4d3b0"/>
+    <text x="132" y="442" fill="#1c1915" font-size="15" font-weight="650">Take the pictures that survived</text>
+    <text x="132" y="464" fill="#6b645c" font-size="13">PNG or YUV, named by byte offset, plus Annex B.</text>
+    <text x="132" y="482" fill="#6b645c" font-size="13">--all-frames also writes recovered.mp4.</text>
+  </g>
+
+  <rect x="548" y="92" width="372" height="184" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="572" y="124" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">Default run</text>
+  <text x="572" y="156" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">IDR pictures only. A frame is kept once the</text>
+  <text x="572" y="176" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">next picture proves the previous one arrived</text>
+  <text x="572" y="196" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">whole. The slice under the cut is reported</text>
+  <text x="572" y="216" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">and left undecoded unless you ask for it.</text>
+  <text x="572" y="248" fill="#1c1915" font-family="ui-monospace, ui-monospace, monospace" font-size="12">iframe-extract clip.mp4 --size 1280x536</text>
+
+  <rect x="548" y="300" width="372" height="200" rx="10" fill="#fffcf7" stroke="#d9d3c7"/>
+  <text x="572" y="332" fill="#1c1915" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="650">When the file needs more</text>
+  <text x="572" y="364" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">--with-audio steps over interleaved audio.</text>
+  <text x="572" y="386" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">--include-non-idr keeps other intra slices.</text>
+  <text x="572" y="408" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">--include-partial tries the cut frame.</text>
+  <text x="572" y="430" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">--all-frames also decodes P-frames.</text>
+  <text x="572" y="464" fill="#6b645c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">--json writes the machine-readable report.</text>
+</svg>
