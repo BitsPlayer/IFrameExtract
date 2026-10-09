@@ -3,7 +3,9 @@
 use serde::Serialize;
 
 use super::frame::Frame;
-use super::sps::ParamSource;
+use super::nal::Nal;
+use super::sei::X264Options;
+use super::sps::{ParamSource, ParameterSets};
 
 pub struct Options {
     pub width: u32,
@@ -17,14 +19,60 @@ pub struct Options {
     pub all_frames: bool,
 }
 
+/// The inputs analysis needs: everything in `Options` that affects carving and parameter recovery.
+#[derive(Debug, Clone)]
+pub struct CarveOptions {
+    pub width: u32,
+    pub height: u32,
+    pub with_audio: bool,
+}
+
+/// Which access units `decode` should decode.
+#[derive(Debug, Clone)]
+pub enum Selection {
+    Filtered {
+        include_non_idr: bool,
+        include_partial: bool,
+        all_frames: bool,
+    },
+    /// An index into `CarveAnalysis::access_units`.
+    Single(usize),
+}
+
+/// Everything recovered without decoding a picture: the NAL chain, access units and parameter sets.
+#[derive(Debug, Clone)]
+pub struct CarveAnalysis {
+    pub width: u32,
+    pub height: u32,
+    pub with_audio: bool,
+    pub mdat_payload_start: u64,
+    pub mdat_payload_end: u64,
+    pub nal_length_size: usize,
+    pub nals: Vec<Nal>,
+    /// Stepped-over `(offset, len)` regions inside `mdat`.
+    pub skipped: Vec<(u64, u64)>,
+    pub truncation_offset: Option<u64>,
+    pub trusted_data_end: u64,
+    pub x264_opts: X264Options,
+    pub x264_options_found: bool,
+    pub params: ParameterSets,
+    pub qp_attempts: usize,
+    pub access_units: Vec<AccessUnit>,
+}
+
 /// One access unit: the run of VCL NALs belonging to a single picture.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AccessUnit {
     pub nal_indices: Vec<usize>,
     pub offset: u64,
     pub is_idr: bool,
     pub is_intra: bool,
     pub complete: bool,
+    /// Bytes this picture occupies in the source file, as `FrameRecord::source_size`.
+    pub size: u64,
+    /// Index into the access unit list of the IDR starting this GOP. Pictures before the first
+    /// IDR share group 0, i.e. they are grouped with the start of the list.
+    pub gop: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

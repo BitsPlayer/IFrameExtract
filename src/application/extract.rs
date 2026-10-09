@@ -1,12 +1,18 @@
 //! Carve, recover parameter sets, group access units, and decode through a decoder port.
 
-use anyhow::{Result, bail};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::application::ports::VideoDecoder;
+use anyhow::{Result, anyhow, bail};
+use rayon::prelude::*;
+
+use crate::application::ports::{FrameDecoder, VideoDecoder};
 use crate::container::find_mdat;
 use crate::domain::annexb::to_annexb;
 use crate::domain::frame::Frame;
-use crate::domain::model::{AccessUnit, Extraction, FrameRecord, Options, Report};
+use crate::domain::model::{
+    AccessUnit, CarveAnalysis, CarveOptions, Extraction, FrameRecord, Options, Report, Selection,
+};
 use crate::nal::{self, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SLICE, NAL_SPS, Nal};
 use crate::report::Reporter;
 use crate::sei::{X264Options, parse_x264_sei};
@@ -17,9 +23,39 @@ pub fn extract_with_decoder(
     data: &[u8],
     input_name: &str,
     opts: &Options,
-    reporter: &mut dyn Reporter,
+    reporter: &mut (dyn Reporter + Send),
     factory: &dyn VideoDecoder,
 ) -> Result<Extraction> {
+    let analysis = analyze(
+        data,
+        &CarveOptions {
+            width: opts.width,
+            height: opts.height,
+            with_audio: opts.with_audio,
+        },
+        reporter,
+        factory,
+    )?;
+    decode(
+        data,
+        &analysis,
+        &Selection::Filtered {
+            include_non_idr: opts.include_non_idr,
+            include_partial: opts.include_partial,
+            all_frames: opts.all_frames,
+        },
+        input_name,
+        reporter,
+        factory,
+    )
+}
+
+pub fn analyze(
+    data: &[u8],
+    opts: &CarveOptions,
+    reporter: &mut dyn Reporter,
+    factory: &dyn VideoDecoder,
+) -> Result<CarveAnalysis> {
     reporter.phase("finding mdat");
     let mdat = find_mdat(data)?;
     reporter.finish_phase(&format!(
@@ -64,7 +100,12 @@ pub fn extract_with_decoder(
     let x264_options_found = x264_opts.is_some();
     let x264_opts = x264_opts.unwrap_or_default();
 
-    let access_units = group_access_units(&walk.nals, data, walk.truncation_offset.is_none());
+    let access_units = group_access_units(
+        &walk.nals,
+        data,
+        walk.nal_length_size,
+        walk.truncation_offset.is_none(),
+    );
     reporter.note(&format!(
         "{} access units, {} intra",
         access_units.len(),
@@ -95,204 +136,173 @@ pub fn extract_with_decoder(
         params.source, params.pic_init_qp, qp_attempts
     ));
 
-    let mut frames = Vec::new();
-    let mut records = Vec::new();
-
-    let wanted: Vec<&AccessUnit> = access_units
+    let trusted_data_end = access_units
         .iter()
-        .filter(|au| {
-            let keep = opts.all_frames || au.is_idr || (opts.include_non_idr && au.is_intra);
-            keep && (au.complete || opts.include_partial)
-        })
-        .collect();
+        .filter(|au| au.complete)
+        .filter_map(|au| au.nal_indices.last())
+        .map(|&i| walk.nals[i].payload_offset + walk.nals[i].declared_len as u64)
+        .max()
+        .unwrap_or(mdat.payload_start);
 
-    let mut annexb = Vec::new();
-    for au in &wanted {
-        if au.is_idr {
-            annexb.extend_from_slice(&to_annexb(&[&params.sps, &params.pps]));
+    Ok(CarveAnalysis {
+        width: opts.width,
+        height: opts.height,
+        with_audio: opts.with_audio,
+        mdat_payload_start: mdat.payload_start,
+        mdat_payload_end: mdat.payload_end,
+        nal_length_size: walk.nal_length_size,
+        nals: walk.nals,
+        skipped: walk.skipped,
+        truncation_offset: walk.truncation_offset,
+        trusted_data_end,
+        x264_opts,
+        x264_options_found,
+        params,
+        qp_attempts,
+        access_units,
+    })
+}
+
+pub fn decode(
+    data: &[u8],
+    a: &CarveAnalysis,
+    selection: &Selection,
+    input_name: &str,
+    reporter: &mut (dyn Reporter + Send),
+    factory: &dyn VideoDecoder,
+) -> Result<Extraction> {
+    let (wanted, all_frames, include_partial): (Vec<&AccessUnit>, bool, bool) = match *selection {
+        Selection::Filtered {
+            include_non_idr,
+            include_partial,
+            all_frames,
+        } => (
+            a.access_units
+                .iter()
+                .filter(|au| {
+                    let keep = all_frames || au.is_idr || (include_non_idr && au.is_intra);
+                    keep && (au.complete || include_partial)
+                })
+                .collect(),
+            all_frames,
+            include_partial,
+        ),
+        Selection::Single(i) => {
+            let Some(au) = a.access_units.get(i) else {
+                bail!("access unit {i} out of range ({} total)", a.access_units.len());
+            };
+            (vec![au], false, !au.complete)
         }
-        let payloads: Vec<&[u8]> = au
-            .nal_indices
-            .iter()
-            .map(|&i| &walk.nals[i])
-            .filter(|n| au.complete || n.complete)
-            .map(|n| n.payload(data))
-            .collect();
-        annexb.extend_from_slice(&to_annexb(&payloads));
-    }
+    };
 
-    let phase = if opts.all_frames {
+    let phase = if all_frames {
         "decoding frames (I + P)"
     } else {
         "decoding I-frames"
     };
     reporter.phase(phase);
 
-    let mut stream_frames: Option<Vec<Frame>> = None;
-    if opts.all_frames {
-        if let Ok(df) = factory.decode_stream(&annexb, opts.width as usize, opts.height as usize) {
-            if !df.is_empty() {
-                stream_frames = Some(df);
-            }
+    let total = wanted.len() as u64;
+    let done = AtomicU64::new(0);
+    let shared = Mutex::new(&mut *reporter);
+    let tick = |au: &AccessUnit, n: u64| {
+        let d = done.fetch_add(n, Ordering::Relaxed) + n;
+        shared.lock().unwrap().progress(
+            d,
+            total,
+            &format!("frame {d}/{total}  off {}", au.offset),
+        );
+    };
+
+    // (frame, sps_profile) per wanted access unit, in order.
+    let mut annexb = Vec::new();
+    let outcomes: Vec<(Option<Frame>, Option<String>)> = match *selection {
+        Selection::Single(i) if !wanted[0].is_intra => {
+            let au = wanted[0];
+            let gop: Vec<&AccessUnit> = a.access_units[au.gop..=i].iter().collect();
+            annexb = gop_annexb(data, a, &gop);
+            let mut frames = decode_gop(data, a, &gop, factory, true)?;
+            tick(au, 1);
+            vec![(frames.pop().flatten(), None)]
         }
-    }
-
-    if let Some(df) = stream_frames {
-        let mut df_iter = df.into_iter();
-        for (i, au) in wanted.iter().enumerate() {
-            let frame = df_iter.next();
-            let source_size: u64 = au
-                .nal_indices
-                .iter()
-                .map(|&idx| (walk.nal_length_size + walk.nals[idx].available_len) as u64)
-                .sum();
-            let record = FrameRecord {
-                index: i,
-                offset: au.offset,
-                source_size,
-                nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
-                slice_count: au.nal_indices.len(),
-                partial: !au.complete,
-                decoded: frame.is_some(),
-                sps_profile: None,
-            };
-            records.push(record.clone());
-            if let Some(f) = frame {
-                frames.push((record, f));
+        _ if all_frames => {
+            let mut groups: Vec<Vec<&AccessUnit>> = Vec::new();
+            for au in &wanted {
+                match groups.last_mut() {
+                    Some(g) if g[0].gop == au.gop => g.push(au),
+                    _ => groups.push(vec![au]),
+                }
             }
-            reporter.progress(
-                (i + 1) as u64,
-                wanted.len() as u64,
-                &format!("frame {}/{}  off {}", i + 1, wanted.len(), au.offset),
-            );
+            let results: Vec<(Vec<u8>, Vec<Option<Frame>>)> = groups
+                .par_iter()
+                .map(|g| {
+                    let frames = decode_gop(data, a, g, factory, include_partial)?;
+                    tick(g[g.len() - 1], g.len() as u64);
+                    Ok((gop_annexb(data, a, g), frames))
+                })
+                .collect::<Result<_>>()?;
+            let mut out = Vec::with_capacity(wanted.len());
+            for (stream, frames) in results {
+                annexb.extend_from_slice(&stream);
+                out.extend(frames.into_iter().map(|f| (f, None)));
+            }
+            out
         }
-    } else {
-        let mut decoder = factory.open(opts.include_partial)?;
-        let mut emitted = 0usize;
-        for (i, au) in wanted.iter().enumerate() {
-            let payloads: Vec<&[u8]> = au
-                .nal_indices
-                .iter()
-                .map(|&i| &walk.nals[i])
-                .filter(|n| au.complete || n.complete)
-                .map(|n| n.payload(data))
-                .collect();
-            let mut units: Vec<&[u8]> = vec![&params.sps, &params.pps];
-            units.extend_from_slice(&payloads);
-            let au_stream = to_annexb(&units);
+        _ => {
+            annexb = gop_annexb(data, a, &wanted);
+            wanted
+                .par_iter()
+                .map_init(
+                    || factory.open(include_partial),
+                    |decoder, au| {
+                        let decoder = decoder.as_mut().map_err(|e| anyhow!("{e}"))?;
+                        let r = decode_one_au(data, a, au, decoder, factory, include_partial)?;
+                        tick(au, 1);
+                        Ok(r)
+                    },
+                )
+                .collect::<Result<_>>()?
+        }
+    };
 
-            let mut decoded = match decoder.decode_au(&au_stream) {
-                Ok(frame) => frame,
-                Err(_) => {
-                    decoder = factory.open(opts.include_partial)?;
-                    None
-                }
-            };
-
-            let mut frame_sps_profile = None;
-            if decoded.is_none()
-                && (params.source == ParamSource::Synthesized
-                    || params.source == ParamSource::SynthesizedHardware)
-            {
-                for variant in option_variants(&x264_opts) {
-                    for qp in qp_candidates(&x264_opts) {
-                        let candidate = synthesize(opts.width, opts.height, &variant, qp);
-                        let mut probe_units: Vec<&[u8]> = vec![&candidate.sps, &candidate.pps];
-                        probe_units.extend_from_slice(&payloads);
-                        let mut probe_dec = factory.open(false)?;
-                        if let Ok(Some(f)) = probe_dec.decode_au(&to_annexb(&probe_units)) {
-                            decoded = Some(f);
-                            frame_sps_profile = Some("x264".to_string());
-                            break;
-                        }
-                    }
-                    if decoded.is_some() {
-                        break;
-                    }
-                }
-
-                if decoded.is_none() {
-                    let hw_qps = hardware_qp_candidates();
-                    let hw_profiles = hardware_profile_variants();
-                    let hw_base = X264Options {
-                        bframes: 0,
-                        b_pyramid: 0,
-                        weighted_pred: false,
-                        weighted_bipred: false,
-                        ..x264_opts.clone()
-                    };
-                    let hw_opts_variants = hardware_opts_variants(&hw_base);
-                    'hw_retry: for profile in &hw_profiles {
-                        for hw_opts in &hw_opts_variants {
-                            for &qp in &hw_qps {
-                                let candidate =
-                                    synthesize_profile(opts.width, opts.height, hw_opts, qp, *profile);
-                                let mut probe_units: Vec<&[u8]> = vec![&candidate.sps, &candidate.pps];
-                                probe_units.extend_from_slice(&payloads);
-                                let mut probe_dec = factory.open(false)?;
-                                if let Ok(Some(f)) = probe_dec.decode_au(&to_annexb(&probe_units)) {
-                                    decoded = Some(f);
-                                    frame_sps_profile = Some(profile.label());
-                                    break 'hw_retry;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let source_size: u64 = au
-                .nal_indices
-                .iter()
-                .map(|&i| (walk.nal_length_size + walk.nals[i].available_len) as u64)
-                .sum();
-            let record = FrameRecord {
-                index: emitted,
-                offset: au.offset,
-                source_size,
-                nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
-                slice_count: au.nal_indices.len(),
-                partial: !au.complete,
-                decoded: decoded.is_some(),
-                sps_profile: frame_sps_profile,
-            };
-            records.push(record.clone());
-            if let Some(frame) = decoded {
-                frames.push((record, frame));
-            }
-            emitted += 1;
-            reporter.progress(
-                (i + 1) as u64,
-                wanted.len() as u64,
-                &format!("frame {}/{}  off {}", i + 1, wanted.len(), au.offset),
-            );
+    let mut frames = Vec::new();
+    let mut records = Vec::with_capacity(wanted.len());
+    for (index, (au, (decoded, sps_profile))) in wanted.iter().zip(outcomes).enumerate() {
+        let record = FrameRecord {
+            index,
+            offset: au.offset,
+            source_size: au.size,
+            nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
+            slice_count: au.nal_indices.len(),
+            partial: !au.complete,
+            decoded: decoded.is_some(),
+            sps_profile,
+        };
+        records.push(record.clone());
+        if let Some(f) = decoded {
+            frames.push((record, f));
         }
     }
     reporter.finish_phase(&format!("{} of {} decoded", frames.len(), wanted.len()));
 
     let report = Report {
         input: input_name.to_string(),
-        width: opts.width,
-        height: opts.height,
-        mdat_payload_start: mdat.payload_start,
-        nal_length_size: walk.nal_length_size,
-        nal_count: walk.nals.len(),
-        truncation_offset: walk.truncation_offset,
-        skipped_regions: walk.skipped_regions,
-        skipped_bytes: walk.skipped_bytes,
-        trusted_data_end: access_units
-            .iter()
-            .filter(|au| au.complete)
-            .filter_map(|au| au.nal_indices.last())
-            .map(|&i| walk.nals[i].payload_offset + walk.nals[i].declared_len as u64)
-            .max()
-            .unwrap_or(mdat.payload_start),
-        param_source: params.source,
-        profile_idc: crate::sps::profile_for(&x264_opts),
-        pic_init_qp: params.pic_init_qp,
-        qp_search_attempts: qp_attempts,
-        x264_options_found,
-        access_units: access_units.len(),
-        intra_access_units: access_units.iter().filter(|a| a.is_intra).count(),
+        width: a.width,
+        height: a.height,
+        mdat_payload_start: a.mdat_payload_start,
+        nal_length_size: a.nal_length_size,
+        nal_count: a.nals.len(),
+        truncation_offset: a.truncation_offset,
+        skipped_regions: a.skipped.len(),
+        skipped_bytes: a.skipped.iter().map(|&(_, len)| len).sum(),
+        trusted_data_end: a.trusted_data_end,
+        param_source: a.params.source,
+        profile_idc: crate::sps::profile_for(&a.x264_opts),
+        pic_init_qp: a.params.pic_init_qp,
+        qp_search_attempts: a.qp_attempts,
+        x264_options_found: a.x264_options_found,
+        access_units: a.access_units.len(),
+        intra_access_units: a.access_units.iter().filter(|x| x.is_intra).count(),
         frames: records,
     };
 
@@ -303,6 +313,139 @@ pub fn extract_with_decoder(
     })
 }
 
+fn au_payloads<'a>(data: &'a [u8], a: &CarveAnalysis, au: &AccessUnit) -> Vec<&'a [u8]> {
+    au.nal_indices
+        .iter()
+        .map(|&i| &a.nals[i])
+        .filter(|n| au.complete || n.complete)
+        .map(|n| n.payload(data))
+        .collect()
+}
+
+/// SPS and PPS go in front of every IDR, as the stream is otherwise parameter-set free.
+fn gop_annexb(data: &[u8], a: &CarveAnalysis, aus: &[&AccessUnit]) -> Vec<u8> {
+    let mut annexb = Vec::new();
+    for au in aus {
+        if au.is_idr {
+            annexb.extend_from_slice(&to_annexb(&[&a.params.sps, &a.params.pps]));
+        }
+        annexb.extend_from_slice(&to_annexb(&au_payloads(data, a, au)));
+    }
+    annexb
+}
+
+/// One frame (or `None`) per access unit. The whole run goes through the stream decoder; if that
+/// fails or yields nothing, a sequential decoder takes it one access unit at a time.
+fn decode_gop(
+    data: &[u8],
+    a: &CarveAnalysis,
+    aus: &[&AccessUnit],
+    factory: &dyn VideoDecoder,
+    include_partial: bool,
+) -> Result<Vec<Option<Frame>>> {
+    let stream = gop_annexb(data, a, aus);
+    if let Ok(df) = factory.decode_stream(&stream, a.width as usize, a.height as usize)
+        && !df.is_empty()
+    {
+        let mut it = df.into_iter();
+        return Ok(aus.iter().map(|_| it.next()).collect());
+    }
+
+    let mut decoder = factory.open(include_partial)?;
+    let mut out = Vec::with_capacity(aus.len());
+    for au in aus {
+        let mut units: Vec<&[u8]> = Vec::new();
+        if au.is_idr {
+            units.extend([a.params.sps.as_slice(), a.params.pps.as_slice()]);
+        }
+        units.extend(au_payloads(data, a, au));
+        match decoder.decode_au(&to_annexb(&units)) {
+            Ok(f) => out.push(f),
+            Err(_) => {
+                decoder = factory.open(include_partial)?;
+                out.push(None);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_one_au(
+    data: &[u8],
+    a: &CarveAnalysis,
+    au: &AccessUnit,
+    decoder: &mut Box<dyn FrameDecoder>,
+    factory: &dyn VideoDecoder,
+    include_partial: bool,
+) -> Result<(Option<Frame>, Option<String>)> {
+    let params = &a.params;
+    let x264_opts = &a.x264_opts;
+    let payloads = au_payloads(data, a, au);
+    let mut units: Vec<&[u8]> = vec![&params.sps, &params.pps];
+    units.extend_from_slice(&payloads);
+    let au_stream = to_annexb(&units);
+
+    let mut decoded = match decoder.decode_au(&au_stream) {
+        Ok(frame) => frame,
+        Err(_) => {
+            *decoder = factory.open(include_partial)?;
+            None
+        }
+    };
+
+    let mut frame_sps_profile = None;
+    if decoded.is_none()
+        && (params.source == ParamSource::Synthesized
+            || params.source == ParamSource::SynthesizedHardware)
+    {
+        for variant in option_variants(x264_opts) {
+            for qp in qp_candidates(x264_opts) {
+                let candidate = synthesize(a.width, a.height, &variant, qp);
+                let mut probe_units: Vec<&[u8]> = vec![&candidate.sps, &candidate.pps];
+                probe_units.extend_from_slice(&payloads);
+                let mut probe_dec = factory.open(false)?;
+                if let Ok(Some(f)) = probe_dec.decode_au(&to_annexb(&probe_units)) {
+                    decoded = Some(f);
+                    frame_sps_profile = Some("x264".to_string());
+                    break;
+                }
+            }
+            if decoded.is_some() {
+                break;
+            }
+        }
+
+        if decoded.is_none() {
+            let hw_qps = hardware_qp_candidates();
+            let hw_profiles = hardware_profile_variants();
+            let hw_base = X264Options {
+                bframes: 0,
+                b_pyramid: 0,
+                weighted_pred: false,
+                weighted_bipred: false,
+                ..x264_opts.clone()
+            };
+            let hw_opts_variants = hardware_opts_variants(&hw_base);
+            'hw_retry: for profile in &hw_profiles {
+                for hw_opts in &hw_opts_variants {
+                    for &qp in &hw_qps {
+                        let candidate = synthesize_profile(a.width, a.height, hw_opts, qp, *profile);
+                        let mut probe_units: Vec<&[u8]> = vec![&candidate.sps, &candidate.pps];
+                        probe_units.extend_from_slice(&payloads);
+                        let mut probe_dec = factory.open(false)?;
+                        if let Ok(Some(f)) = probe_dec.decode_au(&to_annexb(&probe_units)) {
+                            decoded = Some(f);
+                            frame_sps_profile = Some(profile.label());
+                            break 'hw_retry;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((decoded, frame_sps_profile))
+}
+
 /// A VCL NAL with `first_mb_in_slice == 0` starts a new picture. This is what makes the
 /// multi-slice encodes group correctly without relying on access unit delimiters.
 ///
@@ -310,7 +453,12 @@ pub fn extract_with_decoder(
 /// multi-slice frame whose last slice fell past the cut would look whole, because each surviving
 /// slice is individually well formed - nothing but the arrival of the next picture proves the
 /// previous one was fully received.
-fn group_access_units(nals: &[Nal], data: &[u8], clean_end: bool) -> Vec<AccessUnit> {
+fn group_access_units(
+    nals: &[Nal],
+    data: &[u8],
+    nal_length_size: usize,
+    clean_end: bool,
+) -> Vec<AccessUnit> {
     let mut units: Vec<AccessUnit> = Vec::new();
 
     for (i, n) in nals.iter().enumerate() {
@@ -328,12 +476,23 @@ fn group_access_units(nals: &[Nal], data: &[u8], clean_end: bool) -> Vec<AccessU
                 is_idr: n.nal_type == NAL_IDR,
                 is_intra: header.is_intra(),
                 complete: n.complete,
+                size: (nal_length_size + n.available_len) as u64,
+                gop: 0,
             });
         } else {
             let au = units.last_mut().unwrap();
             au.nal_indices.push(i);
             au.complete &= n.complete;
+            au.size += (nal_length_size + n.available_len) as u64;
         }
+    }
+
+    let mut gop = 0;
+    for (i, au) in units.iter_mut().enumerate() {
+        if au.is_idr {
+            gop = i;
+        }
+        au.gop = gop;
     }
 
     if !clean_end && let Some(last) = units.last_mut() {
@@ -356,7 +515,7 @@ fn recover_parameter_sets(
     nals: &[Nal],
     access_units: &[AccessUnit],
     x264_opts: &X264Options,
-    opts: &Options,
+    opts: &CarveOptions,
     reporter: &mut dyn Reporter,
     factory: &dyn VideoDecoder,
 ) -> Result<(ParameterSets, usize)> {

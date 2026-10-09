@@ -10,7 +10,7 @@ pub trait FrameDecoder {
     fn decode_au(&mut self, annexb: &[u8]) -> Result<Option<Frame>>;
 }
 
-pub trait VideoDecoder {
+pub trait VideoDecoder: Sync {
     fn open(&self, conceal_errors: bool) -> Result<Box<dyn FrameDecoder>>;
     fn decode_stream(
         &self,

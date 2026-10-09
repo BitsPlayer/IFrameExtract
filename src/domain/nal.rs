@@ -50,6 +50,9 @@ pub struct Walk {
     /// interleaved chunks of another track, usually audio.
     pub skipped_regions: usize,
     pub skipped_bytes: u64,
+    /// The stepped-over regions as `(offset, len)`; `skipped_regions` and `skipped_bytes` are
+    /// their count and total.
+    pub skipped: Vec<(u64, u64)>,
 }
 
 fn header_ok(byte: u8) -> bool {
@@ -410,16 +413,14 @@ fn walk_once(
     let mut cur = first;
     let span = end.saturating_sub(start).max(1);
     let mut truncation_offset = None;
-    let mut skipped_regions = 0usize;
-    let mut skipped_bytes = 0u64;
+    let mut skipped: Vec<(u64, u64)> = Vec::new();
     let mut widest_gap = 0u64;
     let mut last_report = start;
 
     if first > start {
         // Counted, but deliberately not treated as evidence of the interleave scale: the chain is
         // joined part-way through this chunk, so its length says nothing about a whole one.
-        skipped_regions += 1;
-        skipped_bytes += first - start;
+        skipped.push((start, first - start));
     }
 
     loop {
@@ -427,8 +428,7 @@ fn walk_once(
             if cur != end {
                 // A complete mdat cannot have been cut here, so a stray tail is another track's.
                 if allow_resync && mdat.complete {
-                    skipped_regions += 1;
-                    skipped_bytes += end - cur;
+                    skipped.push((cur, end - cur));
                 } else {
                     truncation_offset = Some(cur);
                 }
@@ -452,15 +452,13 @@ fn walk_once(
                 widest_gap,
             ) {
                 Skip::Resumed(next) => {
-                    skipped_regions += 1;
-                    skipped_bytes += next - cur;
+                    skipped.push((cur, next - cur));
                     widest_gap = widest_gap.max(next - cur);
                     cur = next;
                     continue;
                 }
                 Skip::TrailingChunk => {
-                    skipped_regions += 1;
-                    skipped_bytes += end - cur;
+                    skipped.push((cur, end - cur));
                     break;
                 }
                 Skip::Truncated => {
@@ -494,15 +492,13 @@ fn walk_once(
                 widest_gap,
             ) {
                 Skip::Resumed(next) => {
-                    skipped_regions += 1;
-                    skipped_bytes += next - cur;
+                    skipped.push((cur, next - cur));
                     widest_gap = widest_gap.max(next - cur);
                     cur = next;
                     continue;
                 }
                 Skip::TrailingChunk => {
-                    skipped_regions += 1;
-                    skipped_bytes += end - cur;
+                    skipped.push((cur, end - cur));
                     break;
                 }
                 Skip::Truncated => {
@@ -554,8 +550,9 @@ fn walk_once(
         nals,
         nal_length_size: length_size,
         truncation_offset,
-        skipped_regions,
-        skipped_bytes,
+        skipped_regions: skipped.len(),
+        skipped_bytes: skipped.iter().map(|&(_, len)| len).sum(),
+        skipped,
     }
 }
 
