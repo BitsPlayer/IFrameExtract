@@ -24,6 +24,7 @@ fn run(rel: &str, width: u32, height: u32) -> iframe_extract::extract::Extractio
             include_partial: false,
             with_audio: false,
             all_frames: false,
+            codec: None,
         },
     )
     .expect("extraction succeeds")

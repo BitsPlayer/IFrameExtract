@@ -71,3 +71,67 @@ pub fn find_mdat(data: &[u8]) -> Result<MdatRange> {
 fn fourcc(t: &[u8; 4]) -> String {
     t.iter().map(|&b| b as char).collect()
 }
+
+/// What the file says about itself before `mdat`. Purely informational: MP4 and QuickTime share
+/// the box layout the carver relies on, so nothing downstream branches on it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContainerInfo {
+    /// `mov` for QuickTime, `mp4` for ISO base media, `unknown` without an `ftyp`.
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brand: Option<String>,
+}
+
+impl ContainerInfo {
+    pub fn read(data: &[u8]) -> Self {
+        let brand = (data.len() >= 12 && &data[4..8] == b"ftyp").then(|| fourcc(&[
+            data[8], data[9], data[10], data[11],
+        ]));
+        let kind = match brand.as_deref() {
+            Some("qt  ") => "mov",
+            Some(_) => "mp4",
+            // QuickTime predates `ftyp`; files from old cameras open straight on a `wide`, `mdat`
+            // or `moov` atom.
+            None if data.len() >= 8 && matches!(&data[4..8], b"wide" | b"mdat" | b"moov" | b"free" | b"skip") => "mov",
+            None => "unknown",
+        };
+        Self {
+            kind,
+            brand: brand.map(|b| b.trim_end().to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boxed(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        v.extend(typ);
+        v.extend(body);
+        v
+    }
+
+    #[test]
+    fn quicktime_and_iso_files_are_told_apart() {
+        let mov = [boxed(b"ftyp", b"qt  \0\0\x02\0qt  "), boxed(b"wide", b""), boxed(b"mdat", b"x")].concat();
+        let info = ContainerInfo::read(&mov);
+        assert_eq!((info.kind, info.brand.as_deref()), ("mov", Some("qt")));
+
+        let mp4 = [boxed(b"ftyp", b"isom\0\0\x02\0isom"), boxed(b"mdat", b"x")].concat();
+        assert_eq!(ContainerInfo::read(&mp4).kind, "mp4");
+
+        // Pre-ftyp QuickTime, as old cameras write it.
+        let old = [boxed(b"wide", b""), boxed(b"mdat", b"x")].concat();
+        assert_eq!(ContainerInfo::read(&old).kind, "mov");
+    }
+
+    #[test]
+    fn mdat_after_a_quicktime_wide_atom_is_found() {
+        let mov = [boxed(b"ftyp", b"qt  \0\0\x02\0qt  "), boxed(b"wide", b""), boxed(b"mdat", b"abc")].concat();
+        let m = find_mdat(&mov).unwrap();
+        assert_eq!(&mov[m.payload_start as usize..m.payload_end as usize], b"abc");
+        assert!(m.complete);
+    }
+}

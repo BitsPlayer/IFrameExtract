@@ -4,12 +4,9 @@
 //! each sample is `[length][NAL bytes]`. Walking it from the start of `mdat` reconstructs every
 //! frame boundary exactly, and the chain stops validating precisely at the truncation point.
 
+use crate::codec::Codec;
 use crate::container::MdatRange;
 use crate::report::{Reporter, Silent};
-
-/// NAL unit types x264 actually emits. Anything else is treated as a broken chain, which is what
-/// makes `startcodes` and `random` padding fail to produce plausible successors.
-const ALLOWED_TYPES: [u8; 7] = [1, 5, 6, 7, 8, 9, 12];
 
 pub const NAL_SLICE: u8 = 1;
 pub const NAL_IDR: u8 = 5;
@@ -55,34 +52,6 @@ pub struct Walk {
     pub skipped: Vec<(u64, u64)>,
 }
 
-fn header_ok(byte: u8) -> bool {
-    if byte & 0x80 != 0 {
-        // forbidden_zero_bit
-        return false;
-    }
-    let nal_type = byte & 0x1f;
-    if !ALLOWED_TYPES.contains(&nal_type) {
-        return false;
-    }
-    // The spec fixes nal_ref_idc for these types, so it is free validation against garbage that
-    // happens to carry a plausible type.
-    let ref_idc = (byte >> 5) & 0x03;
-    match nal_type {
-        NAL_IDR | NAL_SPS | NAL_PPS => ref_idc != 0,
-        NAL_SEI | 9 | 12 => ref_idc == 0,
-        _ => true,
-    }
-}
-
-/// Slice NALs get a second opinion from their header: a fabricated unit rarely yields a
-/// macroblock address inside the picture and a valid slice_type.
-fn slice_header_ok(payload: &[u8], mb_count: u32) -> bool {
-    match crate::slice::parse(payload) {
-        Some(h) => h.first_mb_in_slice < mb_count && h.slice_type <= 9,
-        None => false,
-    }
-}
-
 /// A coded frame cannot plausibly be many times its own uncompressed size. Garbage length
 /// prefixes read out of padding are typically hundreds of megabytes, so this upper bound is what
 /// stops a fabricated unit from being mistaken for the frame that straddles the cut.
@@ -92,42 +61,28 @@ fn max_nal_len(mb_count: u32) -> usize {
     mb_count as usize * 3072
 }
 
-fn len_ok(nal_type: u8, len: usize, mb_count: u32) -> bool {
-    if len > max_nal_len(mb_count) {
-        return false;
-    }
-    match nal_type {
-        // A slice NAL is never a couple of bytes; this rejects the 1-byte units that
-        // `startcodes` padding synthesises.
-        NAL_SLICE | NAL_IDR => len >= 8,
-        _ => len >= 2,
-    }
+fn len_ok(codec: Codec, nal_type: u8, len: usize, mb_count: u32) -> bool {
+    len <= max_nal_len(mb_count) && len >= codec.min_len(nal_type)
 }
 
 /// Header-level check for a unit whose tail is missing: the slice header still has to make sense.
-fn slice_or_other_ok(data: &[u8], payload: u64, available: usize, mb_count: u32) -> bool {
-    let nal_type = data[payload as usize] & 0x1f;
-    if nal_type != NAL_SLICE && nal_type != NAL_IDR {
-        return true;
+fn partial_unit_ok(codec: Codec, data: &[u8], payload: u64, available: usize, mb_count: u32) -> bool {
+    let unit = &data[payload as usize..payload as usize + available];
+    if available < codec.header_len() || !codec.header_ok(unit) {
+        return false;
     }
-    let slice = &data[payload as usize..payload as usize + available];
-    slice_header_ok(slice, mb_count)
+    !codec.is_vcl(codec.nal_type(unit)) || codec.slice_header_ok(unit, mb_count)
 }
 
 /// Full validation of one unit whose bytes are all present.
-fn unit_ok(data: &[u8], payload: u64, len: usize, mb_count: u32) -> bool {
-    let b = data[payload as usize];
-    if !header_ok(b) || !len_ok(b & 0x1f, len, mb_count) {
+fn unit_ok(codec: Codec, data: &[u8], payload: u64, len: usize, mb_count: u32) -> bool {
+    let unit = &data[payload as usize..payload as usize + len];
+    if len < codec.header_len() || !codec.header_ok(unit) {
         return false;
     }
-    let nal_type = b & 0x1f;
-    if nal_type == NAL_SLICE || nal_type == NAL_IDR {
-        let slice = &data[payload as usize..payload as usize + len];
-        if !slice_header_ok(slice, mb_count) {
-            return false;
-        }
-    }
-    true
+    let nal_type = codec.nal_type(unit);
+    len_ok(codec, nal_type, len, mb_count)
+        && (!codec.is_vcl(nal_type) || codec.slice_header_ok(unit, mb_count))
 }
 
 /// How far to scan for the chain to resume before concluding the file is truncated, until the
@@ -182,6 +137,7 @@ fn unit_at(data: &[u8], end: u64, pos: u64, length_size: usize) -> Option<(u64, 
 /// Follows the chain from `pos` for at most `want` units, returning how many validated and the
 /// offset they end at. Only fully-present units count, so it stops at the first gap.
 fn run_chain(
+    codec: Codec,
     data: &[u8],
     end: u64,
     pos: u64,
@@ -196,7 +152,7 @@ fn run_chain(
         let Some((payload, len)) = unit_at(data, end, cur, length_size) else {
             break;
         };
-        if !unit_ok(data, payload, len as usize, mb_count) {
+        if !unit_ok(codec, data, payload, len as usize, mb_count) {
             break;
         }
         count += 1;
@@ -215,13 +171,9 @@ fn run_chain(
 /// A chunk holds whole samples and an AVC sample is a whole picture, so the chain always resumes
 /// on a picture boundary. A slice that claims to resume mid-picture is therefore a length prefix
 /// read out of the other track's bytes, however well its header validates.
-fn starts_picture(data: &[u8], payload: u64, len: u64) -> bool {
-    let nal_type = data[payload as usize] & 0x1f;
-    if nal_type != NAL_SLICE && nal_type != NAL_IDR {
-        return true;
-    }
-    let slice = &data[payload as usize..(payload + len) as usize];
-    crate::slice::parse(slice).is_some_and(|h| h.first_mb_in_slice == 0)
+fn starts_picture(codec: Codec, data: &[u8], payload: u64, len: u64) -> bool {
+    let unit = &data[payload as usize..(payload + len) as usize];
+    !codec.is_vcl(codec.nal_type(unit)) || codec.starts_picture(unit) == Some(true)
 }
 
 /// Consecutive units that make a resync candidate decisive on the spot.
@@ -237,6 +189,7 @@ const RESYNC_LOOKAHEAD: usize = 4;
 /// holds a single NAL, a fabricated unit whose length happens to span the gap chains one further
 /// than the genuine chunk start does.
 fn resync(
+    codec: Codec,
     data: &[u8],
     end: u64,
     from: u64,
@@ -252,10 +205,11 @@ fn resync(
     while pos < stop {
         if let Some((payload, len)) = unit_at(data, end, pos, length_size)
             && len <= ceiling
-            && unit_ok(data, payload, len as usize, mb_count)
-            && starts_picture(data, payload, len)
+            && unit_ok(codec, data, payload, len as usize, mb_count)
+            && starts_picture(codec, data, payload, len)
         {
-            let (units, _) = run_chain(data, end, pos, length_size, mb_count, RESYNC_LOOKAHEAD);
+            let (units, _) =
+                run_chain(codec, data, end, pos, length_size, mb_count, RESYNC_LOOKAHEAD);
             if units >= RESYNC_LOOKAHEAD {
                 return Some(pos);
             }
@@ -283,6 +237,7 @@ const PLAIN_UNITS: usize = 4;
 /// all. A wrong width collects whatever happens to pass the one-byte header test instead, which
 /// skews hard towards the parameter-set and delimiter types.
 fn slice_share(
+    codec: Codec,
     data: &[u8],
     end: u64,
     pos: u64,
@@ -295,21 +250,70 @@ fn slice_share(
 
     while total < PROBE_UNITS {
         match unit_at(data, end, cur, length_size) {
-            Some((payload, len)) if unit_ok(data, payload, len as usize, mb_count) => {
-                let nal_type = data[payload as usize] & 0x1f;
-                if nal_type == NAL_SLICE || nal_type == NAL_IDR {
+            Some((payload, len)) if unit_ok(codec, data, payload, len as usize, mb_count) => {
+                if codec.is_vcl(codec.nal_type(&data[payload as usize..])) {
                     slices += 1;
                 }
                 total += 1;
                 cur = payload + len;
             }
-            _ => match resync(data, end, cur + 1, length_size, mb_count, PROBE_GAP) {
+            _ => match resync(codec, data, end, cur + 1, length_size, mb_count, PROBE_GAP) {
                 Some(next) => cur = next,
                 None => break,
             },
         }
     }
     (slices, total)
+}
+
+/// Lower bound of the 95% Wilson score interval for `k` successes in `n` trials.
+fn wilson_lower_bound(k: usize, n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let (k, n, z) = (k as f64, n as f64, 1.96f64);
+    let p = k / n;
+    let centre = p + z * z / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt();
+    (centre - margin) / (1.0 + z * z / n)
+}
+
+/// Decides which NAL grammar the `mdat` payload is written in.
+///
+/// Nothing outside `moov` names the codec, so the bitstream has to. Each grammar is probed the same
+/// way the walker would start - straight from the top of `mdat`, or from the first point the chain
+/// picks up when another track's chunk comes first - and the one most confidently made of coded
+/// slices wins.
+///
+/// A real chain is almost all slices over dozens of units. Read with the wrong grammar or width,
+/// the same bytes give either a low share - H.264's one-byte header lets audio pass as a mix of
+/// tiny "slices" and parameter sets - or a high share over only a unit or two. Neither raw counts
+/// nor byte coverage separate those from a truncated file's few real pictures, so the score is
+/// the lower confidence bound of the slice share, which rewards both purity and sample size.
+pub fn detect_codec(data: &[u8], mdat: &MdatRange, mb_count: u32) -> Codec {
+    let start = mdat.payload_start;
+    let end = mdat.payload_end;
+    let score = |codec: Codec| {
+        [4usize, 2, 1, 3]
+            .into_iter()
+            .filter_map(|ls| {
+                let at = if run_chain(codec, data, end, start, ls, mb_count, PLAIN_UNITS).0
+                    >= PLAIN_UNITS
+                {
+                    start
+                } else {
+                    resync(codec, data, end, start, ls, mb_count, GAP_CEILING)?
+                };
+                let (slices, units) = slice_share(codec, data, end, at, ls, mb_count);
+                Some(wilson_lower_bound(slices, units))
+            })
+            .fold(0.0, f64::max)
+    };
+    if score(Codec::H265) > score(Codec::H264) {
+        Codec::H265
+    } else {
+        Codec::H264
+    }
 }
 
 /// What a break in the chain turned out to be.
@@ -322,7 +326,9 @@ enum Skip {
     Truncated,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn skip_non_video(
+    codec: Codec,
     data: &[u8],
     mdat: &MdatRange,
     at: u64,
@@ -335,7 +341,15 @@ fn skip_non_video(
         return Skip::Truncated;
     }
     let limit = gap_limit(widest_gap);
-    if let Some(next) = resync(data, mdat.payload_end, at + 1, length_size, mb_count, limit) {
+    if let Some(next) = resync(
+        codec,
+        data,
+        mdat.payload_end,
+        at + 1,
+        length_size,
+        mb_count,
+        limit,
+    ) {
         return Skip::Resumed(next);
     }
     // Nothing resumed. When `mdat` is intact and the unparsed run is short enough to be one more
@@ -355,17 +369,18 @@ fn skip_non_video(
 /// told apart by result rather than by heuristic - on an interleaved file skipping unlocks the
 /// whole video, while in padding it scrapes together a handful of extra units.
 pub fn walk(
+    codec: Codec,
     data: &[u8],
     mdat: &MdatRange,
     mb_count: u32,
     with_audio: bool,
     reporter: &mut dyn Reporter,
 ) -> Walk {
-    let plain = walk_once(data, mdat, mb_count, reporter, false);
+    let plain = walk_once(codec, data, mdat, mb_count, reporter, false);
     if !with_audio || plain.truncation_offset.is_none() {
         return plain;
     }
-    let skipped = walk_once(data, mdat, mb_count, &mut Silent, true);
+    let skipped = walk_once(codec, data, mdat, mb_count, &mut Silent, true);
     if skipped.nals.len() >= plain.nals.len().saturating_mul(2).max(1) {
         skipped
     } else {
@@ -374,6 +389,7 @@ pub fn walk(
 }
 
 fn walk_once(
+    codec: Codec,
     data: &[u8],
     mdat: &MdatRange,
     mb_count: u32,
@@ -387,7 +403,7 @@ fn walk_once(
     // width that runs straight off the top of mdat settles it: only the real one chains there.
     let (plain_units, _, plain_width) = [4usize, 2, 1, 3]
         .into_iter()
-        .map(|ls| (run_chain(data, end, start, ls, mb_count, 64).0, ls == 4, ls))
+        .map(|ls| (run_chain(codec, data, end, start, ls, mb_count, 64).0, ls == 4, ls))
         .max_by_key(|&(units, is_four, _)| (units, is_four))
         .unwrap();
 
@@ -400,8 +416,8 @@ fn walk_once(
         [4usize, 2, 1, 3]
             .into_iter()
             .filter_map(|ls| {
-                let at = resync(data, end, start, ls, mb_count, GAP_CEILING)?;
-                let (slices, total) = slice_share(data, end, at, ls, mb_count);
+                let at = resync(codec, data, end, start, ls, mb_count, GAP_CEILING)?;
+                let (slices, total) = slice_share(codec, data, end, at, ls, mb_count);
                 (total > 0).then(|| (ls, at, slices * 1000 / total))
             })
             .max_by_key(|&(ls, _, share)| (share, ls == 4))
@@ -443,6 +459,7 @@ fn walk_once(
 
         if len == 0 || payload >= end {
             match skip_non_video(
+                codec,
                 data,
                 mdat,
                 cur,
@@ -469,20 +486,19 @@ fn walk_once(
         }
 
         let available = (end - payload).min(len) as usize;
-        let b = data[payload as usize];
         let straddles = payload + len > end;
 
         // A straddling unit cannot be fully validated - only its header is present - so it is
         // checked as far as its surviving bytes allow.
         let valid = if straddles {
-            header_ok(b)
-                && len <= max_nal_len(mb_count) as u64
-                && slice_or_other_ok(data, payload, available, mb_count)
+            len <= max_nal_len(mb_count) as u64
+                && partial_unit_ok(codec, data, payload, available, mb_count)
         } else {
-            unit_ok(data, payload, len as usize, mb_count)
+            unit_ok(codec, data, payload, len as usize, mb_count)
         };
         if !valid {
             match skip_non_video(
+                codec,
                 data,
                 mdat,
                 cur,
@@ -512,7 +528,7 @@ fn walk_once(
             payload_offset: payload,
             declared_len: len as usize,
             available_len: available,
-            nal_type: b & 0x1f,
+            nal_type: codec.nal_type(&data[payload as usize..]),
             complete: !straddles,
         });
 
@@ -583,7 +599,7 @@ mod tests {
             payload_end: data.len() as u64,
             complete,
         };
-        walk(data, &mdat, MB_COUNT, true, &mut Silent)
+        walk(Codec::H264, data, &mdat, MB_COUNT, true, &mut Silent)
     }
 
     #[test]
@@ -683,6 +699,58 @@ mod tests {
             Some(2072),
             "a gap out of scale with the established interleave ends the walk"
         );
+    }
+
+    /// `[len][NAL]` for an H.265 picture: first_slice_segment_in_pic_flag set, pps id 0.
+    fn hevc_unit(nal_type: u8, payload_len: usize) -> Vec<u8> {
+        let mut v = (payload_len as u32).to_be_bytes().to_vec();
+        v.push(nal_type << 1);
+        v.push(1); // layer 0, temporal id 0
+        // first_slice_segment_in_pic_flag, no_output_of_prior_pics_flag, ue(0) pps id
+        v.push(0b1010_0000);
+        v.resize(4 + payload_len, 0x10);
+        v
+    }
+
+    #[test]
+    fn hevc_chain_is_detected_and_walked_through_another_track() {
+        let mut data = Vec::new();
+        data.extend(hevc_unit(32, 24)); // VPS
+        data.extend(hevc_unit(33, 40)); // SPS
+        data.extend(hevc_unit(34, 8)); // PPS
+        // Detection is statistical, so give it a stream of realistic length rather than a handful
+        // of units.
+        for i in 0..11 {
+            data.extend(hevc_unit(if i == 0 { 20 } else { 1 }, 64));
+            data.extend(other_track(500));
+        }
+        data.extend(hevc_unit(1, 64));
+        let mdat = MdatRange {
+            payload_start: 0,
+            payload_end: data.len() as u64,
+            complete: true,
+        };
+
+        assert_eq!(detect_codec(&data, &mdat, MB_COUNT), Codec::H265);
+        let walk = walk(Codec::H265, &data, &mdat, MB_COUNT, true, &mut Silent);
+        assert_eq!(walk.nals.len(), 15);
+        assert_eq!(walk.skipped_regions, 11);
+        assert!(walk.truncation_offset.is_none());
+        assert_eq!(walk.nals[3].nal_type, 20);
+    }
+
+    #[test]
+    fn h264_chain_is_not_mistaken_for_hevc() {
+        let mut data = Vec::new();
+        for _ in 0..6 {
+            data.extend(idr(64));
+        }
+        let mdat = MdatRange {
+            payload_start: 0,
+            payload_end: data.len() as u64,
+            complete: true,
+        };
+        assert_eq!(detect_codec(&data, &mdat, MB_COUNT), Codec::H264);
     }
 
     #[test]

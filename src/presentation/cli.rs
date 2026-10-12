@@ -1,4 +1,5 @@
 use super::progress::PacmanBar;
+use iframe_extract::codec::Codec;
 use iframe_extract::decode::ColorMatrix;
 use iframe_extract::extract;
 use iframe_extract::report::{self, Reporter};
@@ -17,12 +18,22 @@ enum Format {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum CodecArg {
+    /// Detect from the bitstream.
+    Auto,
+    H264,
+    /// H.265 / HEVC.
+    H265,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Matrix {
     Bt709,
     Bt601,
 }
 
-/// Recovers I-frames from MP4/H.264 files by carving the bitstream, without ever reading `moov`.
+/// Recovers I-frames from MP4/MOV files (H.264 or H.265) by carving the bitstream, without ever
+/// reading `moov`.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
@@ -37,6 +48,11 @@ struct Args {
 
     #[arg(short, long, value_enum, default_value_t = Format::Png)]
     format: Format,
+
+    /// Video codec. Nothing outside `moov` names it, so by default it is detected from the
+    /// bitstream.
+    #[arg(long, value_enum, default_value_t = CodecArg::Auto)]
+    codec: CodecArg,
 
     /// Colour matrix for PNG output. Lives in the SPS VUI, which is lost with `moov`, so it
     /// cannot be recovered from a truncated file.
@@ -68,7 +84,8 @@ struct Args {
     #[arg(long)]
     json: Option<PathBuf>,
 
-    /// Write the recovered Annex B elementary stream to a custom path (defaults to <output>/recovered.264).
+    /// Write the recovered Annex B elementary stream to a custom path (defaults to
+    /// <output>/recovered.264, or recovered.265 for H.265).
     #[arg(long)]
     emit_annexb: Option<PathBuf>,
 
@@ -138,6 +155,11 @@ pub fn run() -> Result<()> {
         include_partial: args.include_partial,
         with_audio: args.with_audio,
         all_frames: args.all_frames,
+        codec: match args.codec {
+            CodecArg::Auto => None,
+            CodecArg::H264 => Some(Codec::H264),
+            CodecArg::H265 => Some(Codec::H265),
+        },
     };
 
     let name = args.input.display().to_string();
@@ -191,7 +213,12 @@ pub fn run() -> Result<()> {
         Some(
             args.emit_annexb
                 .clone()
-                .unwrap_or_else(|| args.output.join("recovered.264")),
+                .unwrap_or_else(|| {
+                    args.output.join(format!(
+                        "recovered.{}",
+                        result.report.codec.annexb_extension()
+                    ))
+                }),
         )
     };
     if let Some(path) = &annexb_path {
@@ -206,6 +233,7 @@ pub fn run() -> Result<()> {
                     "-y",
                     "-v", "error",
                     "-r", "30",
+                    "-f", result.report.codec.ffmpeg_format(),
                     "-i", &path.to_string_lossy(),
                     "-c", "copy",
                     &mp4_path.to_string_lossy(),
@@ -226,7 +254,9 @@ pub fn run() -> Result<()> {
     if !args.quiet {
         let r = &result.report;
         reporter.summary(&format!(
-            "{} NALs, {} access units, {} frames written ({:?} params, qp {}, {} attempt(s))",
+            "{} in {}: {} NALs, {} access units, {} frames written ({:?} params, qp {}, {} attempt(s))",
+            r.codec.label(),
+            r.container.kind,
             r.nal_count,
             r.access_units,
             result.frames.len(),

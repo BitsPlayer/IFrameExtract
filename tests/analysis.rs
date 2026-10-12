@@ -31,6 +31,7 @@ fn carve() -> CarveOptions {
         width: 1280,
         height: 720,
         with_audio: false,
+        codec: None,
     }
 }
 
@@ -50,6 +51,7 @@ fn analyze_then_decode_matches_extract() {
             include_partial: false,
             with_audio: false,
             all_frames: false,
+            codec: None,
         },
     )
     .unwrap();

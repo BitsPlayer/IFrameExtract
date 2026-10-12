@@ -7,7 +7,8 @@ use anyhow::{Result, anyhow, bail};
 use rayon::prelude::*;
 
 use crate::application::ports::{FrameDecoder, VideoDecoder};
-use crate::container::find_mdat;
+use crate::container::{ContainerInfo, find_mdat};
+use crate::domain::codec::Codec;
 use crate::domain::annexb::to_annexb;
 use crate::domain::frame::Frame;
 use crate::domain::model::{
@@ -32,6 +33,7 @@ pub fn extract_with_decoder(
             width: opts.width,
             height: opts.height,
             with_audio: opts.with_audio,
+            codec: opts.codec,
         },
         reporter,
         factory,
@@ -58,16 +60,26 @@ pub fn analyze(
 ) -> Result<CarveAnalysis> {
     reporter.phase("finding mdat");
     let mdat = find_mdat(data)?;
+    let container = ContainerInfo::read(data);
     reporter.finish_phase(&format!(
-        "payload {}..{} ({})",
+        "{} payload {}..{} ({})",
+        container.kind,
         mdat.payload_start,
         mdat.payload_end,
         crate::report::human_bytes(mdat.payload_end.saturating_sub(mdat.payload_start)),
     ));
 
     let mb_count = opts.width.div_ceil(16) * opts.height.div_ceil(16);
+    let codec = opts
+        .codec
+        .unwrap_or_else(|| nal::detect_codec(data, &mdat, mb_count));
+    reporter.note(&format!(
+        "{} bitstream{}",
+        codec.label(),
+        if opts.codec.is_some() { " (forced)" } else { "" }
+    ));
     reporter.phase("walking NAL chain");
-    let walk = nal::walk(data, &mdat, mb_count, opts.with_audio, reporter);
+    let walk = nal::walk(codec, data, &mdat, mb_count, opts.with_audio, reporter);
     if walk.nals.is_empty() {
         bail!("no NAL units recovered from mdat");
     }
@@ -90,6 +102,10 @@ pub fn analyze(
         ));
     } else {
         reporter.note("chain ran cleanly to the end of mdat");
+    }
+
+    if codec == Codec::H265 {
+        return super::hevc::analyze(data, opts, &mdat, container, walk, reporter);
     }
 
     let x264_opts = walk
@@ -145,6 +161,8 @@ pub fn analyze(
         .unwrap_or(mdat.payload_start);
 
     Ok(CarveAnalysis {
+        codec,
+        container,
         width: opts.width,
         height: opts.height,
         with_audio: opts.with_audio,
@@ -160,6 +178,7 @@ pub fn analyze(
         params,
         qp_attempts,
         access_units,
+        hevc: None,
     })
 }
 
@@ -248,6 +267,15 @@ pub fn decode(
             }
             out
         }
+        _ if a.codec == Codec::H265 => {
+            annexb = gop_annexb(data, a, &wanted);
+            let frames = decode_hevc_pictures(data, a, &wanted, &annexb, factory);
+            if let Some(last) = wanted.last() {
+                tick(last, wanted.len() as u64);
+            }
+            let label = a.hevc.as_ref().and_then(|h| h.label.clone());
+            frames.into_iter().map(|f| (f, label.clone())).collect()
+        }
         _ => {
             annexb = gop_annexb(data, a, &wanted);
             wanted
@@ -272,7 +300,7 @@ pub fn decode(
             index,
             offset: au.offset,
             source_size: au.size,
-            nal_type: if au.is_idr { NAL_IDR } else { NAL_SLICE },
+            nal_type: au.nal_type,
             slice_count: au.nal_indices.len(),
             partial: !au.complete,
             decoded: decoded.is_some(),
@@ -287,6 +315,8 @@ pub fn decode(
 
     let report = Report {
         input: input_name.to_string(),
+        codec: a.codec,
+        container: a.container.clone(),
         width: a.width,
         height: a.height,
         mdat_payload_start: a.mdat_payload_start,
@@ -297,12 +327,17 @@ pub fn decode(
         skipped_bytes: a.skipped.iter().map(|&(_, len)| len).sum(),
         trusted_data_end: a.trusted_data_end,
         param_source: a.params.source,
-        profile_idc: crate::sps::profile_for(&a.x264_opts),
+        profile_idc: match &a.hevc {
+            None => crate::sps::profile_for(&a.x264_opts),
+            Some(h) => h.model.as_ref().map_or(0, |m| if m.bit_depth > 8 { 2 } else { 1 }),
+        },
         pic_init_qp: a.params.pic_init_qp,
         qp_search_attempts: a.qp_attempts,
         x264_options_found: a.x264_options_found,
+        x265_options_found: a.hevc.as_ref().is_some_and(|h| h.x265_options_found),
         access_units: a.access_units.len(),
         intra_access_units: a.access_units.iter().filter(|x| x.is_intra).count(),
+        hevc_params: a.hevc.as_ref().and_then(|h| h.model.clone()),
         frames: records,
     };
 
@@ -322,12 +357,23 @@ fn au_payloads<'a>(data: &'a [u8], a: &CarveAnalysis, au: &AccessUnit) -> Vec<&'
         .collect()
 }
 
-/// SPS and PPS go in front of every IDR, as the stream is otherwise parameter-set free.
+/// Parameter sets as they go in front of a keyframe: SPS and PPS, preceded by the VPS for H.265.
+fn param_units(a: &CarveAnalysis) -> Vec<&[u8]> {
+    let mut units: Vec<&[u8]> = Vec::with_capacity(3);
+    if let Some(h) = &a.hevc {
+        units.push(&h.vps);
+    }
+    units.extend([a.params.sps.as_slice(), a.params.pps.as_slice()]);
+    units
+}
+
+/// Parameter sets go in front of every IDR (every IRAP for H.265), as the stream is otherwise
+/// parameter-set free.
 fn gop_annexb(data: &[u8], a: &CarveAnalysis, aus: &[&AccessUnit]) -> Vec<u8> {
     let mut annexb = Vec::new();
     for au in aus {
         if au.is_idr {
-            annexb.extend_from_slice(&to_annexb(&[&a.params.sps, &a.params.pps]));
+            annexb.extend_from_slice(&to_annexb(&param_units(a)));
         }
         annexb.extend_from_slice(&to_annexb(&au_payloads(data, a, au)));
     }
@@ -344,11 +390,15 @@ fn decode_gop(
     include_partial: bool,
 ) -> Result<Vec<Option<Frame>>> {
     let stream = gop_annexb(data, a, aus);
-    if let Ok(df) = factory.decode_stream(&stream, a.width as usize, a.height as usize)
+    if let Ok(df) = factory.decode_stream(a.codec, &stream, a.width as usize, a.height as usize)
         && !df.is_empty()
     {
         let mut it = df.into_iter();
         return Ok(aus.iter().map(|_| it.next()).collect());
+    }
+    if a.codec == Codec::H265 {
+        // The per-access-unit decoder is H.264 only.
+        return Ok(aus.iter().map(|_| None).collect());
     }
 
     let mut decoder = factory.open(include_partial)?;
@@ -368,6 +418,37 @@ fn decode_gop(
         }
     }
     Ok(out)
+}
+
+/// H.265 keyframes through the stream decoder: all at once when the picture count comes back
+/// whole, otherwise one at a time, since a picture ffmpeg drops would shift every later one.
+fn decode_hevc_pictures(
+    data: &[u8],
+    a: &CarveAnalysis,
+    wanted: &[&AccessUnit],
+    stream: &[u8],
+    factory: &dyn VideoDecoder,
+) -> Vec<Option<Frame>> {
+    let (w, h) = (a.width as usize, a.height as usize);
+    if let Ok(frames) = factory.decode_stream(Codec::H265, stream, w, h)
+        && frames.len() == wanted.len()
+    {
+        return frames.into_iter().map(Some).collect();
+    }
+    wanted
+        .par_iter()
+        .map(|au| {
+            if !au.is_intra {
+                return None;
+            }
+            let mut units = param_units(a);
+            units.extend(au_payloads(data, a, au));
+            factory
+                .decode_stream(Codec::H265, &to_annexb(&units), w, h)
+                .ok()
+                .and_then(|f| f.into_iter().next())
+        })
+        .collect()
 }
 
 fn decode_one_au(
@@ -473,6 +554,7 @@ fn group_access_units(
             units.push(AccessUnit {
                 nal_indices: vec![i],
                 offset: n.offset,
+                nal_type: n.nal_type,
                 is_idr: n.nal_type == NAL_IDR,
                 is_intra: header.is_intra(),
                 complete: n.complete,

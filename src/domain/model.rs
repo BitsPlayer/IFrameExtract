@@ -2,7 +2,10 @@
 
 use serde::Serialize;
 
+use super::codec::Codec;
+use super::container::ContainerInfo;
 use super::frame::Frame;
+use super::hevc::params::HevcParams;
 use super::nal::Nal;
 use super::sei::X264Options;
 use super::sps::{ParamSource, ParameterSets};
@@ -17,6 +20,8 @@ pub struct Options {
     pub with_audio: bool,
     /// Also recover and decode P-frames (inter-coded pictures), recovering the full video stream.
     pub all_frames: bool,
+    /// Force a codec instead of detecting it from the bitstream.
+    pub codec: Option<Codec>,
 }
 
 /// The inputs analysis needs: everything in `Options` that affects carving and parameter recovery.
@@ -25,6 +30,8 @@ pub struct CarveOptions {
     pub width: u32,
     pub height: u32,
     pub with_audio: bool,
+    /// Force a codec instead of detecting it from the bitstream.
+    pub codec: Option<Codec>,
 }
 
 /// Which access units `decode` should decode.
@@ -42,6 +49,8 @@ pub enum Selection {
 /// Everything recovered without decoding a picture: the NAL chain, access units and parameter sets.
 #[derive(Debug, Clone)]
 pub struct CarveAnalysis {
+    pub codec: Codec,
+    pub container: ContainerInfo,
     pub width: u32,
     pub height: u32,
     pub with_audio: bool,
@@ -55,9 +64,24 @@ pub struct CarveAnalysis {
     pub trusted_data_end: u64,
     pub x264_opts: X264Options,
     pub x264_options_found: bool,
+    /// SPS and PPS the pictures decode with. For H.265 the VPS is in `hevc`.
     pub params: ParameterSets,
     pub qp_attempts: usize,
     pub access_units: Vec<AccessUnit>,
+    /// H.265 only.
+    pub hevc: Option<HevcState>,
+}
+
+/// What H.265 recovery found beyond the SPS/PPS pair.
+#[derive(Debug, Clone)]
+pub struct HevcState {
+    pub vps: Vec<u8>,
+    /// The model behind the parameter sets: always for synthesised ones, and for in-band ones the
+    /// validator can represent.
+    pub model: Option<HevcParams>,
+    /// Which known encoder (or the sweep) the synthesised set came from.
+    pub label: Option<String>,
+    pub x265_options_found: bool,
 }
 
 /// One access unit: the run of VCL NALs belonging to a single picture.
@@ -65,6 +89,9 @@ pub struct CarveAnalysis {
 pub struct AccessUnit {
     pub nal_indices: Vec<usize>,
     pub offset: u64,
+    /// Type of the first VCL NAL.
+    pub nal_type: u8,
+    /// A picture that decodes on its own: IDR for H.264, any IRAP for H.265.
     pub is_idr: bool,
     pub is_intra: bool,
     pub complete: bool,
@@ -93,6 +120,8 @@ pub struct FrameRecord {
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub input: String,
+    pub codec: Codec,
+    pub container: ContainerInfo,
     pub width: u32,
     pub height: u32,
     pub mdat_payload_start: u64,
@@ -111,8 +140,14 @@ pub struct Report {
     pub pic_init_qp: i32,
     pub qp_search_attempts: usize,
     pub x264_options_found: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub x265_options_found: bool,
     pub access_units: usize,
     pub intra_access_units: usize,
+    /// The H.265 parameter set the frames were decoded with, when it was synthesised or could be
+    /// read back from the in-band one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hevc_params: Option<HevcParams>,
     pub frames: Vec<FrameRecord>,
 }
 
