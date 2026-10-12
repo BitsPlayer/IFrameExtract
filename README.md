@@ -1,13 +1,13 @@
 # iframe-extract
 
-Recovers I-frames from MP4/H.264 files as images, by carving the bitstream directly. It never
-reads the `moov` atom — not even when one is present.
+Recovers I-frames from MP4 and QuickTime MOV files, H.264 or H.265, as images, by carving the
+bitstream directly. It never reads the `moov` atom — not even when one is present.
 
 That constraint is the point. A truncated MP4 has lost `moov`, and with it both the sample index
-*and* the `avcC` box holding the SPS/PPS, so no ordinary demuxer can decode a single frame. This
-tool reconstructs both from the bytes that survive.
+*and* the `avcC`/`hvcC` box holding the parameter sets, so no ordinary demuxer can decode a single frame.
+This tool reconstructs both from the bytes that survive.
 
-Scope: MP4 / H.264 / no audio / known resolution.
+Scope: MP4 or MOV / H.264 or H.265 / known resolution. Interleaved audio needs `--with-audio`.
 
 ## Usage
 
@@ -23,6 +23,9 @@ Stderr gets a pacman-style progress bar for each phase (read, walk, recover, dec
 | `--size WxH` | **required** — resolution cannot be recovered without an SPS |
 | `--format png\|yuv` | `yuv` writes planar 4:2:0 for byte-exact comparison against a reference decoder |
 | `--matrix bt709\|bt601` | colour matrix for PNG output; lives in the lost SPS VUI, so it must be told to us |
+| `--codec auto\|h264\|h265` | defaults to detecting the codec from the bitstream |
+| `--with-audio` | step over interleaved audio chunks in `mdat` |
+| `--all-frames` | decode every picture, not just keyframes (uses ffmpeg) |
 | `--include-non-idr` | also emit intra slices that are not IDR |
 | `--include-partial` | also attempt the frame straddling the cut |
 | `--json FILE` | machine-readable report |
@@ -80,6 +83,46 @@ fully received.
 **Decode.** openh264, behind a `FrameDecoder` trait so a hand-written Rust intra decoder can be
 added later as a second backend without touching the carver.
 
+**MOV.** QuickTime and MP4 share the box layout the carver relies on, so a `.mov` is walked the
+same way: `wide` in place of `free`, and pre-`ftyp` files that open straight on `wide` or `mdat`.
+The report records which container the `ftyp` brand names.
+
+## H.265
+
+**Detection.** Nothing outside `moov` names the codec, so both NAL grammars are probed against
+`mdat`, and the one most confidently made of coded slices wins (the lower confidence bound of the
+slice share, so a pure but tiny run of fabricated units cannot beat a truncated file's few real
+pictures). HEVC's two-byte NAL header is
+far more redundant than H.264's (layer id 0, temporal id non-zero, IRAP pictures on the base
+sub-layer), which makes it reject padding even more reliably. Dolby Vision RPUs and the second
+view of MV-HEVC spatial video are accepted in the chain and left out of decoding.
+
+**Parameter sets.** In-band VPS/SPS/PPS win when the encoder repeated them (Intel/AMD VAAPI do).
+Otherwise there is far less to go on than with x264: ffmpeg's libx265 wrapper puts the options SEI
+in `hvcC` with the parameter sets, so a truncated file keeps neither. Worse, ffmpeg's HEVC decoder
+renders a wrong guess as a plausible picture without any error, so it cannot judge candidates
+the way openh264 does for H.264.
+
+So candidates are proven rather than guessed. `hevc::validate` runs the full CABAC syntax of an
+intra slice — SAO, coding quadtree, intra modes, transform tree, residuals — without
+reconstructing anything. Every field that changes how a bin is decoded (CTB and block sizes,
+transform depth, SAO, sign hiding, cu_qp_delta, transform skip, WPP, bit depth, and the QP that
+seeds the contexts) desynchronises the arithmetic decoder when wrong, and a desynchronised decoder
+does not finish each substream exactly on its stop bit. The right set always does.
+
+The search tries x265's presets, Apple VideoToolbox (iPhone) and Intel's hardware encoder first, each across every `init_qp`,
+then a staged sweep: slice-header layouts the keyframes admit, then slice-data fields in order of
+how common they are, on every core. The chosen set is then re-checked against every keyframe, and
+any that disagree join the probes. Fields no parse can observe (strong intra smoothing, scaling
+lists, chroma QP offsets, inter-only settings) are taken from the nearest known encoder.
+
+Real iPhone recordings (iPhone X on iOS 13, iPhone 12 mini on iOS 16; HEVC with LPCM audio and
+metadata tracks interleaved) recover every keyframe byte-identical to ffmpeg's decode, intact and
+truncated. Note that ffmpeg applies the MOV clean aperture and rotation by default; compare with
+`-apply_cropping codec -noautorotate` to see the coded picture this tool writes.
+
+**Decode.** ffmpeg, as for `--all-frames` on H.264; openh264 has no HEVC support.
+
 ## Verification
 
 ```
@@ -98,6 +141,10 @@ Against `../test-data-corpus` (264 files), current status:
 
 Truncated results hold across all six padding types (`none`, `zeros`, `random`, `startcodes`,
 `fakeboxes`, `mp4tail`), 33/33 each.
+
+`tests/hevc.rs` covers H.265 and MOV without the corpus, on files it encodes with ffmpeg:
+keyframes byte-identical to ffmpeg's decode of the intact file, a truncated MOV with AAC, a
+configuration only the sweep finds, codec detection, and the validator rejecting each wrong field.
 
 Comparison is done on planar YUV rather than PNG. Both decoders are conformant, so decoded planes
 are bit-exact and the pass criterion is byte identity, not a similarity threshold. PNG output

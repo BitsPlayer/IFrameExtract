@@ -156,18 +156,26 @@ pub fn to_annexb(nals: &[&[u8]]) -> Vec<u8> {
 /// Used for full-stream recovery containing P-frames (including High Profile features like 8x8 DCT
 /// that OpenH264 does not support). Returns an error if ffmpeg is not installed or fails.
 pub fn decode_stream_ffmpeg(annexb: &[u8], width: usize, height: usize) -> Result<Vec<Frame>> {
+    decode_annexb_ffmpeg(annexb, "h264", &[], width, height)
+}
+
+/// Decodes an Annex B stream of the given ffmpeg `format` (`h264`, `hevc`) to 8-bit 4:2:0 frames.
+/// `extra` goes before the output options. Higher bit depths are converted down by ffmpeg, which
+/// is what PNG output needs anyway.
+pub fn decode_annexb_ffmpeg(
+    annexb: &[u8],
+    format: &str,
+    extra: &[&str],
+    width: usize,
+    height: usize,
+) -> Result<Vec<Frame>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
     let mut child = Command::new("ffmpeg")
-        .args([
-            "-v", "error",
-            "-f", "h264",
-            "-i", "-",
-            "-f", "rawvideo",
-            "-pix_fmt", "yuv420p",
-            "-",
-        ])
+        .args(["-v", "error", "-f", format, "-i", "-"])
+        .args(extra)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

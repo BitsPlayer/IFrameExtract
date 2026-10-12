@@ -52,6 +52,7 @@ fn stitchable_crf_recovers_the_idr() {
             include_partial: false,
             with_audio: false,
             all_frames: false,
+            codec: None,
         },
     )
     .expect("extraction succeeds on stitchable CRF");

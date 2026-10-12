@@ -3,7 +3,8 @@
 use anyhow::{Result, bail};
 use serde::Serialize;
 
-use crate::container::find_mdat;
+use crate::codec::Codec;
+use crate::container::{ContainerInfo, find_mdat};
 use crate::decode::{Frame, FrameDecoder, OpenH264Backend, decode_stream_ffmpeg, to_annexb};
 use crate::nal::{self, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SLICE, NAL_SPS, Nal};
 use crate::report::{Reporter, Silent};
@@ -21,6 +22,8 @@ pub struct Options {
     pub with_audio: bool,
     /// Also recover and decode P-frames (inter-coded pictures), recovering the full video stream.
     pub all_frames: bool,
+    /// Force a codec instead of detecting it from the bitstream.
+    pub codec: Option<Codec>,
 }
 
 /// One access unit: the run of VCL NALs belonging to a single picture.
@@ -51,6 +54,8 @@ pub struct FrameRecord {
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub input: String,
+    pub codec: Codec,
+    pub container: ContainerInfo,
     pub width: u32,
     pub height: u32,
     pub mdat_payload_start: u64,
@@ -69,8 +74,14 @@ pub struct Report {
     pub pic_init_qp: i32,
     pub qp_search_attempts: usize,
     pub x264_options_found: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub x265_options_found: bool,
     pub access_units: usize,
     pub intra_access_units: usize,
+    /// The H.265 parameter set the frames were decoded with, when it was synthesised or could be
+    /// read back from the in-band one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hevc_params: Option<crate::hevc::params::HevcParams>,
     pub frames: Vec<FrameRecord>,
 }
 
@@ -92,16 +103,26 @@ pub fn extract_with(
 ) -> Result<Extraction> {
     reporter.phase("finding mdat");
     let mdat = find_mdat(data)?;
+    let container = ContainerInfo::read(data);
     reporter.finish_phase(&format!(
-        "payload {}..{} ({})",
+        "{} payload {}..{} ({})",
+        container.kind,
         mdat.payload_start,
         mdat.payload_end,
         crate::report::human_bytes(mdat.payload_end.saturating_sub(mdat.payload_start)),
     ));
 
     let mb_count = opts.width.div_ceil(16) * opts.height.div_ceil(16);
+    let codec = opts
+        .codec
+        .unwrap_or_else(|| nal::detect_codec(data, &mdat, mb_count));
+    reporter.note(&format!(
+        "{} bitstream{}",
+        codec.label(),
+        if opts.codec.is_some() { " (forced)" } else { "" }
+    ));
     reporter.phase("walking NAL chain");
-    let walk = nal::walk(data, &mdat, mb_count, opts.with_audio, reporter);
+    let walk = nal::walk(codec, data, &mdat, mb_count, opts.with_audio, reporter);
     if walk.nals.is_empty() {
         bail!("no NAL units recovered from mdat");
     }
@@ -124,6 +145,10 @@ pub fn extract_with(
         ));
     } else {
         reporter.note("chain ran cleanly to the end of mdat");
+    }
+
+    if codec == Codec::H265 {
+        return crate::hevc::extract::extract(data, input_name, opts, &mdat, container, &walk, reporter);
     }
 
     let x264_opts = walk
@@ -341,6 +366,8 @@ pub fn extract_with(
 
     let report = Report {
         input: input_name.to_string(),
+        codec,
+        container,
         width: opts.width,
         height: opts.height,
         mdat_payload_start: mdat.payload_start,
@@ -361,8 +388,10 @@ pub fn extract_with(
         pic_init_qp: params.pic_init_qp,
         qp_search_attempts: qp_attempts,
         x264_options_found,
+        x265_options_found: false,
         access_units: access_units.len(),
         intra_access_units: access_units.iter().filter(|a| a.is_intra).count(),
+        hevc_params: None,
         frames: records,
     };
 

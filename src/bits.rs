@@ -120,4 +120,36 @@ impl<'a> BitReader<'a> {
         }
         Some((1 << zeros) - 1 + self.u(zeros)?)
     }
+
+    pub fn se(&mut self) -> Option<i32> {
+        let k = self.ue()? as i64;
+        let v = if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) };
+        i32::try_from(v).ok()
+    }
+
+    /// Bits consumed so far.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
+/// Unescapes a NAL payload and records where each removed emulation prevention byte stood, so
+/// that byte offsets counted in the escaped payload (HEVC entry points) can be mapped onto the
+/// RBSP.
+pub fn unescape_rbsp_mapped(nal: &[u8]) -> (Vec<u8>, Vec<usize>) {
+    let mut out = Vec::with_capacity(nal.len());
+    let mut removed = Vec::new();
+    let mut i = 0;
+    while i < nal.len() {
+        if i + 2 < nal.len() && nal[i] == 0 && nal[i + 1] == 0 && nal[i + 2] == 3 {
+            out.push(0);
+            out.push(0);
+            removed.push(i + 2);
+            i += 3;
+        } else {
+            out.push(nal[i]);
+            i += 1;
+        }
+    }
+    (out, removed)
 }
